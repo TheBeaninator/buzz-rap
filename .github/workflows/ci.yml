@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  standalone:
+    name: standalone, with FreeFitty
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Build FreeFitty, the sibling RAP runtime
+        working-directory: ${{ runner.temp }}
+        run: cargo install --locked --git https://github.com/TheBeaninator/freefitty --root "$RUNNER_TEMP/ff"
+      - run: cargo fmt -- --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Tests (unit, end to end, and with FreeFitty)
+        run: cargo test --locked
+        env:
+          FREEFITTY_BIN: ${{ runner.temp }}/ff/bin/freefitty
+
+  in-buzz-tree:
+    name: as crates/buzz-rap in block/buzz main
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clone Buzz
+        run: git clone --depth 50 https://github.com/block/buzz "$RUNNER_TEMP/buzz"
+      - name: Put buzz-rap into the tree (applies patches/ if needed)
+        run: scripts/into-buzz-tree.sh "$RUNNER_TEMP/buzz"
+      - name: Test in the workspace
+        working-directory: ${{ runner.temp }}/buzz
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          cargo test -p buzz-rap
+          cargo clippy -p buzz-rap --all-targets -- -D warnings

@@ -1,0 +1,36 @@
+From 6f9e216e1e0d03820b56bf7e4886acbfad54af9e Mon Sep 17 00:00:00 2001
+From: TheBeaninator <9450984+TheBeaninator@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 22:05:02 +0000
+Subject: [PATCH] feat(cli): export the command tree as buzz_cli::command()
+
+Tools that generate an interface from the buzz CLI (a RAP or MCP toolset, shell
+completions, docs) need the clap command definition. build_command() is
+private; command() exposes it unchanged, so generated interfaces follow the CLI
+instead of copying it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: TheBeaninator <9450984+TheBeaninator@users.noreply.github.com>
+---
+ crates/buzz-cli/src/lib.rs | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/crates/buzz-cli/src/lib.rs b/crates/buzz-cli/src/lib.rs
+index f01cd89df..32b72958a 100644
+--- a/crates/buzz-cli/src/lib.rs
++++ b/crates/buzz-cli/src/lib.rs
+@@ -82,6 +82,12 @@ Options:
+ /// clap picks `after_long_help` for `--help` and falls back to `after_help`
+ /// for `-h`, which is what gives the two depths: `-h` keeps the group-level
+ /// summary, `--help` shows every subcommand under every group.
++/// The `buzz` command tree as clap defines it, for tools that generate interfaces from it (buzz-rap builds
++/// its RAP toolset from this, so the tools cannot drift from the commands).
++pub fn command() -> clap::Command {
++    build_command()
++}
++
+ fn build_command() -> clap::Command {
+     let cmd = Cli::command();
+     let groups = help_tree::render(&cmd, 1);
+-- 
+2.53.0
+
