@@ -54,21 +54,28 @@ flags are never exposed.
 calling the binary keeps buzz-rap's behaviour identical to a person typing the command. The cost is one
 short-lived process per call. Values go as `--name=value`, so a value starting with `-` is never a flag.
 
-**One server, one identity.** The agent never sees a key. The server's environment (`BUZZ_PRIVATE_KEY`, or the
-desktop credential the CLI finds) decides who acts. Several agents with distinct identities run several servers.
+**Many identities, one process.** The agent never sees a key. An identities file maps the runtime's
+conversation ids (`group_id`, exact or by prefix) to keys; `BUZZ_PRIVATE_KEY` is the default. Each call's
+`buzz` process gets its conversation's key, each identity gets its own relay connection for subscriptions,
+and the relay's own attribution then names the agent. This is Buzz's model, agents as members with their own
+keys, without a process per agent.
 
 **At-least-once delivery is made safe here.** A RAP runtime may deliver one invocation twice (a crash between
 posting and recording the acknowledgement). buzz-rap keys every call by conversation and call id, runs it once,
 and answers a repeat with the first result. For a message send, this is the difference between one post and two.
 
-**Subscriptions poll.** `buzz_subscribe` reads new messages with `buzz messages get --since` every `--poll-ms`
-and posts each one as a `subscription_event`. Polling through the CLI reuses its authentication and output
-format and survives relay restarts without reconnect logic. A relay push subscription (NIP-01 `REQ` over the
-WebSocket) is the better long-term form. The server drops the agent's own messages by pubkey, which is why
-subscriptions require a known identity: otherwise each reply would wake the agent to reply again.
+**Subscriptions are pushed.** With the relay URL known, buzz-rap keeps one NIP-42-authenticated WebSocket per
+identity (Buzz's own `buzz-ws-client`) and sends a NIP-01 `REQ` per subscription, filtered to the channel's
+message kinds and starting at the subscription's cursor. A message arrives as soon as the relay stores it. A
+dropped connection is re-made with backoff and every subscription asks again from its cursor, so nothing is
+lost, and a repeat at the cursor's second is dropped by event id. If the relay closes a subscription (lost
+membership, a limit), the conversation gets a final event saying why. Without a relay URL, buzz-rap polls
+`buzz messages get --since` instead, which needs nothing beyond the CLI. Either way the server drops the
+agent's own messages by pubkey, which is why subscriptions require a known identity: otherwise each reply would
+wake the agent to reply again.
 
-**An audit log names the calling agent.** The relay sees one key per server, so on its own it cannot say which
-agent did something. buzz-rap writes one JSON line per call, duplicate, refusal and delivered event, keyed by the
+**An audit log names the calling conversation.** The relay sees the key that signed; when several
+conversations share an identity, it cannot say which one acted. buzz-rap writes one JSON line per call, duplicate, refusal and delivered event, keyed by the
 runtime's conversation id and call ids, with the event ids each call produced. Callback URLs are logged by
 origin only, because runtimes keep their callback token in the path.
 
@@ -103,7 +110,7 @@ buzz-rap sits between the two. A durable runtime stays the brain and can keep it
 its agents become members of channels: they act there, are woken there, and leave an audit trail. Moving
 further toward the workspace model is a series of small steps, not a rewrite:
 
-1. One buzz-rap (one key) per agent identity, so the relay itself attributes actions.
+1. One key per agent (an identities file), so the relay itself attributes actions.
 2. One thread per task instead of a flat channel.
 3. A channel canvas as the current view, maintained by an agent.
 4. Workflow approvals for decisions that need a human, once Buzz's approval gates resume runs.
@@ -111,7 +118,5 @@ further toward the workspace model is a series of small steps, not a rewrite:
 ## Possible upstream follow-ups
 
 - `buzz_cli::command()` (the one patch this crate needs).
-- Push subscriptions in buzz-rap through the relay WebSocket instead of polling.
-- A way for one buzz-rap to act as several agent identities, mapped from the runtime's conversation id.
 - An optional provenance tag on events written through buzz-rap (it would be visible to channel members, so it
   belongs in a discussion first).

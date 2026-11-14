@@ -5,15 +5,18 @@
 //! acknowledges at once and posts the result to the invocation's `callback_url` when it is done. A
 //! subscription tool keeps posting `subscription_event`s for the same call until it ends.
 //!
-//! Tools are generated from the CLI's command tree (see `toolset`) and run as `buzz` subprocesses with this
-//! process's environment, so the agent acts with the identity in `BUZZ_PRIVATE_KEY` (or the desktop
-//! credential the CLI finds) and never sees or sets it. `buzz_subscribe` turns new channel messages into
-//! events, which is what lets a RAP agent sleep in a channel and wake when someone talks to it.
+//! Tools are generated from the CLI's command tree (see `toolset`) and run as `buzz` subprocesses. Who acts
+//! is decided per conversation (`identity`): an identities file maps RAP `group_id`s to keys, with
+//! `BUZZ_PRIVATE_KEY` as the default, and the agent never sees or sets a key. `buzz_subscribe` turns new
+//! channel messages into events, pushed over one relay WebSocket per identity (`watch`) or polled, which is
+//! what lets a RAP agent sleep in a channel and wake when someone talks to it.
 
 mod audit;
+mod identity;
 mod server;
 mod subscribe;
 mod toolset;
+mod watch;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -44,6 +47,14 @@ pub struct Args {
     /// How often subscriptions look for new messages, in milliseconds
     #[arg(long, env = "BUZZ_RAP_POLL_MS", default_value_t = 2000)]
     pub poll_ms: u64,
+    /// TOML file mapping RAP conversations (group_id patterns) to agent keys, so one server acts as many
+    /// identities; BUZZ_PRIVATE_KEY stays the default for conversations no entry names
+    #[arg(long, env = "BUZZ_RAP_IDENTITIES")]
+    pub identities: Option<PathBuf>,
+    /// How subscriptions get new messages: push (relay WebSocket), poll (`buzz messages get`), or auto (push
+    /// when BUZZ_RELAY_URL is set)
+    #[arg(long, env = "BUZZ_RAP_DELIVERY", default_value = "auto", value_parser = ["auto", "push", "poll"])]
+    pub delivery: String,
     /// Append-only JSONL audit log: one line per call, refusal, duplicate and subscription delivery, keyed by the
     /// calling conversation and call id, with the Buzz event ids each call produced
     #[arg(long, env = "BUZZ_RAP_AUDIT_LOG")]
@@ -75,21 +86,28 @@ async fn main() -> Result<()> {
     }
     let tools =
         toolset::build(&buzz_cli::command(), &args.allow).context("building the toolset")?;
-    let me = own_pubkey();
+    let identities =
+        identity::Identities::load(args.identities.as_deref()).context("loading identities")?;
+    let relay = std::env::var("BUZZ_RELAY_URL")
+        .ok()
+        .filter(|r| !r.trim().is_empty());
+    let relay_ws = match (args.delivery.as_str(), &relay) {
+        ("poll", _) => None,
+        ("push", None) => anyhow::bail!("--delivery push needs BUZZ_RELAY_URL"),
+        (_, r) => r.as_deref().map(watch::ws_url),
+    };
+    if identities.is_empty() {
+        tracing::warn!("no identity (BUZZ_PRIVATE_KEY or --identities): tools act with whatever credential buzz finds, and subscriptions are refused");
+    }
+    for (name, pubkey) in identities.summary() {
+        tracing::info!(identity = %name, %pubkey, "identity");
+    }
     tracing::info!(
         tools = tools.len(),
-        pubkey = me.as_deref().unwrap_or("unknown"),
+        identities = identities.len(),
+        delivery = if relay_ws.is_some() { "push" } else { "poll" },
         "buzz-rap on {}",
         args.listen
     );
-    server::serve(args, tools, me).await
-}
-
-/// The hex public key of `BUZZ_PRIVATE_KEY`, when set. Without it the CLI may still act through a desktop
-/// credential, but `buzz_subscribe` is refused: it could not tell the agent's own messages apart.
-fn own_pubkey() -> Option<String> {
-    let sk = std::env::var("BUZZ_PRIVATE_KEY").ok()?;
-    nostr::Keys::parse(sk.trim())
-        .ok()
-        .map(|k| k.public_key().to_hex())
+    server::serve(args, tools, identities, relay_ws).await
 }

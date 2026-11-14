@@ -1,9 +1,15 @@
 //! `buzz_subscribe`: new messages in a channel (or one thread of it) become RAP `subscription_event`s for
-//! the call that asked, until it is unsubscribed or expires. This is what lets an agent sleep in a channel
-//! and wake when someone talks to it. Subscriptions survive a restart when `--state` is set.
+//! the call that asked, until it is unsubscribed or expires. This is what lets an agent wait in a channel and
+//! wake when someone talks to it. Subscriptions survive a restart when `--state` is set.
+//!
+//! Delivery is pushed over the relay WebSocket (`watch`) when the relay URL is known, and polled with
+//! `buzz messages get --since` otherwise. Both paths go through `accept`, which keeps each subscription's
+//! cursor, drops repeats and the agent's own messages, and posts the rest.
 
 use crate::audit;
+use crate::identity::Identity;
 use crate::server::{cap, post_callback, run_buzz, App, Invocation};
+use crate::watch;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -27,9 +33,12 @@ pub struct Sub {
     pub mentions_only: bool,
     /// newest created_at already delivered (seconds)
     pub since: u64,
-    /// ids delivered at `since`, so the inclusive `--since` never repeats one
+    /// ids delivered at `since`, so the inclusive cursor never repeats one
     pub seen: Vec<String>,
     pub expires: u64,
+    /// the identity it reads as (an identities-file name, or "default")
+    #[serde(default)]
+    pub identity: Option<String>,
 }
 
 pub fn defs() -> Vec<Value> {
@@ -57,7 +66,11 @@ fn now() -> u64 {
         .unwrap_or(0)
 }
 
-pub async fn start(app: &Arc<App>, inv: &Invocation) -> (bool, String) {
+pub async fn start(
+    app: &Arc<App>,
+    inv: &Invocation,
+    ident: Option<&Arc<Identity>>,
+) -> (bool, String) {
     let a = &inv.arguments;
     let Some(channel) = a
         .get("channel")
@@ -65,6 +78,14 @@ pub async fn start(app: &Arc<App>, inv: &Invocation) -> (bool, String) {
         .filter(|c| !c.is_empty())
     else {
         return (false, "channel is required".into());
+    };
+    let Some(ident) = ident else {
+        // without its own pubkey the server cannot drop the agent's own posts, and each reply would come back as
+        // an event that wakes the agent to reply again
+        return (
+            false,
+            "subscriptions need a known identity (BUZZ_PRIVATE_KEY or an --identities entry for this conversation): without one the agent's own replies would come back as events and wake it in a loop".into(),
+        );
     };
     let hours = a
         .get("hours")
@@ -88,36 +109,35 @@ pub async fn start(app: &Arc<App>, inv: &Invocation) -> (bool, String) {
         since: now(),
         seen: Vec::new(),
         expires: now() + (hours * 3600.0) as u64,
+        identity: Some(ident.name.clone()),
     };
-    if app.me.is_none() {
-        // without its own pubkey the server cannot drop the agent's own posts, and each reply would come back as
-        // an event that wakes the agent to reply again
-        return (
-            false,
-            "subscriptions need BUZZ_PRIVATE_KEY on the server: without it the agent's own replies would come back as events and wake it in a loop".into(),
-        );
-    }
-    // the channel must be readable now, or every poll would fail quietly
-    let (ok, text) = run_buzz(
-        app,
-        vec![
-            "messages".into(),
-            "get".into(),
-            format!("--channel={channel}"),
-            "--limit=1".into(),
-        ],
-    )
-    .await;
+    // the channel must be readable by this identity now, or every delivery would fail quietly
+    let probe = vec![
+        "messages".into(),
+        "get".into(),
+        format!("--channel={channel}"),
+        "--limit=1".into(),
+    ];
+    let (ok, text) = run_buzz(app, Some(ident), probe).await;
     if !ok {
         return (false, format!("cannot read channel {channel}: {text}"));
     }
+    let how = if app.relay_ws.is_some() {
+        "pushed from the relay"
+    } else {
+        "polled"
+    };
     let msg = format!(
-        "Subscribed (subscription {}) to channel {channel}{}{} for {hours} h. New messages arrive as events for this call; reply with buzz_messages_send (reply_to = the event id to answer in its thread). Stop with buzz_unsubscribe.",
+        "Subscribed (subscription {}) to channel {channel}{}{} for {hours} h; new messages are {how} and arrive as events for this call. Reply with buzz_messages_send (reply_to = the event id to answer in its thread). Stop with buzz_unsubscribe.",
         sub.id,
         sub.thread.as_deref().map(|t| format!(", thread {t}")).unwrap_or_default(),
         if sub.mentions_only { ", mentions only" } else { "" },
     );
+    let (group, id) = (sub.group_id.clone(), sub.id.clone());
     app.state.lock().await.subs.push(sub);
+    if let Some(tx) = watch::ensure(app, ident).await {
+        let _ = tx.send(watch::Cmd::Add(group, id));
+    }
     (true, msg)
 }
 
@@ -125,21 +145,14 @@ pub async fn stop(app: &Arc<App>, inv: &Invocation) -> (bool, String) {
     let Some(id) = inv.arguments.get("subscription").and_then(Value::as_str) else {
         return (false, "subscription is required".into());
     };
-    let removed = {
-        let mut s = app.state.lock().await;
-        let at = s
-            .subs
-            .iter()
-            .position(|x| x.id == id && x.group_id == inv.group_id);
-        at.map(|i| s.subs.remove(i))
-    };
-    match removed {
+    match remove(app, &inv.group_id, id).await {
         Some(sub) => {
             send_event(
                 app,
                 &sub,
                 format!("Subscription {} ended: unsubscribed.", sub.id),
                 true,
+                None,
             )
             .await;
             (true, format!("Unsubscribed {id}."))
@@ -148,12 +161,46 @@ pub async fn stop(app: &Arc<App>, inv: &Invocation) -> (bool, String) {
     }
 }
 
-async fn send_event(app: &Arc<App>, sub: &Sub, text: String, last: bool) -> bool {
-    send_event_for(app, sub, text, last, None).await
+/// Take a subscription out of the state and out of its watcher.
+async fn remove(app: &Arc<App>, group: &str, id: &str) -> Option<Sub> {
+    let removed = {
+        let mut s = app.state.lock().await;
+        let at = s
+            .subs
+            .iter()
+            .position(|x| x.id == id && x.group_id == group);
+        at.map(|i| s.subs.remove(i))
+    };
+    if let Some(sub) = &removed {
+        if let Some(name) = &sub.identity {
+            if let Some(tx) = app.watchers.lock().await.get(name) {
+                let _ = tx.send(watch::Cmd::Remove(watch::req_id(group, id)));
+            }
+        }
+        app.save().await;
+    }
+    removed
+}
+
+/// The relay ended a pushed subscription (lost membership, a limit): the conversation hears why, once.
+pub async fn relay_closed(app: &Arc<App>, group: &str, id: &str, why: &str) {
+    if let Some(sub) = remove(app, group, id).await {
+        send_event(
+            app,
+            &sub,
+            format!(
+                "Subscription {} ended: the relay closed it ({why}).",
+                sub.id
+            ),
+            true,
+            None,
+        )
+        .await;
+    }
 }
 
 /// Post one event; `from` is the Buzz message it carries (event id, author), recorded in the audit log.
-async fn send_event_for(
+async fn send_event(
     app: &Arc<App>,
     sub: &Sub,
     text: String,
@@ -162,7 +209,15 @@ async fn send_event_for(
 ) -> bool {
     let body = json!({"type": "subscription_event", "group_id": sub.group_id, "tool_call_id": sub.id, "text": text, "final": last});
     let delivered = post_callback(app.clone(), sub.callback_url.clone(), body).await;
-    let mut e = json!({"group_id": sub.group_id, "subscription": sub.id, "channel": sub.channel, "final": last, "delivered": delivered});
+    let mut e = json!({"group_id": sub.group_id, "subscription": sub.id, "channel": sub.channel, "final": last,
+        "delivered": delivered, "identity_name": sub.identity});
+    if let Some(i) = sub
+        .identity
+        .as_deref()
+        .and_then(|n| app.identities.by_name(n))
+    {
+        e["identity"] = json!(i.pubkey);
+    }
     if let Some((id, author)) = from {
         e["event_id"] = json!(id);
         e["author"] = json!(author);
@@ -182,51 +237,100 @@ async fn send_event_for(
     delivered
 }
 
-/// The poll loop: one pass over every subscription each `--poll-ms`.
+/// Messages seen for one subscription, from either delivery path: move its cursor, drop repeats and what it
+/// does not want, post the rest in order.
+pub async fn accept(app: &Arc<App>, group: &str, id: &str, events: &[Value]) {
+    let mut fresh = Vec::new();
+    let sub = {
+        let mut s = app.state.lock().await;
+        let Some(sub) = s
+            .subs
+            .iter_mut()
+            .find(|x| x.group_id == group && x.id == id)
+        else {
+            return;
+        };
+        let mut sorted: Vec<&Value> = events.iter().collect();
+        sorted.sort_by_key(|e| e.get("created_at").and_then(Value::as_u64).unwrap_or(0));
+        for e in sorted {
+            let eid = e.get("id").and_then(Value::as_str).unwrap_or("").to_owned();
+            let at = e.get("created_at").and_then(Value::as_u64).unwrap_or(0);
+            if eid.is_empty() || at < sub.since || (at == sub.since && sub.seen.contains(&eid)) {
+                continue;
+            }
+            if at > sub.since {
+                sub.since = at;
+                sub.seen.clear();
+            }
+            sub.seen.push(eid);
+            fresh.push(e.clone());
+        }
+        sub.clone()
+    };
+    if fresh.is_empty() {
+        return;
+    }
+    let me = sub
+        .identity
+        .as_deref()
+        .and_then(|n| app.identities.by_name(n))
+        .map(|i| i.pubkey.clone());
+    for e in &fresh {
+        if let Some(text) = describe(e, &sub, me.as_deref()) {
+            let eid = e.get("id").and_then(Value::as_str).unwrap_or("");
+            let author = e.get("pubkey").and_then(Value::as_str).unwrap_or("");
+            send_event(app, &sub, text, false, Some((eid, author))).await;
+        }
+    }
+    app.save().await;
+}
+
+/// The housekeeping loop: ends expired subscriptions, and polls those no watcher carries.
 pub async fn run(app: Arc<App>) {
     let every = Duration::from_millis(app.args.poll_ms.max(250));
+    // subscriptions kept from before a restart go back to their watchers
+    let kept = app.state.lock().await.subs.clone();
+    for s in &kept {
+        if let Some(i) = s
+            .identity
+            .as_deref()
+            .and_then(|n| app.identities.by_name(n))
+        {
+            if let Some(tx) = watch::ensure(&app, &i).await {
+                let _ = tx.send(watch::Cmd::Add(s.group_id.clone(), s.id.clone()));
+            }
+        }
+    }
     loop {
         tokio::time::sleep(every).await;
         let subs = app.state.lock().await.subs.clone();
-        let mut changed = false;
         for sub in subs {
             if now() >= sub.expires {
-                app.state
-                    .lock()
-                    .await
-                    .subs
-                    .retain(|x| !(x.id == sub.id && x.group_id == sub.group_id));
-                send_event(
-                    &app,
-                    &sub,
-                    format!("Subscription {} ended: its time ran out.", sub.id),
-                    true,
-                )
-                .await;
-                changed = true;
+                if let Some(s) = remove(&app, &sub.group_id, &sub.id).await {
+                    send_event(
+                        &app,
+                        &s,
+                        format!("Subscription {} ended: its time ran out.", s.id),
+                        true,
+                        None,
+                    )
+                    .await;
+                }
                 continue;
             }
-            if let Some(next) = poll(&app, sub.clone()).await {
-                let mut s = app.state.lock().await;
-                if let Some(x) = s
-                    .subs
-                    .iter_mut()
-                    .find(|x| x.id == next.id && x.group_id == next.group_id)
-                {
-                    x.since = next.since;
-                    x.seen = next.seen;
-                    changed = true;
-                }
+            if app.relay_ws.is_none() {
+                poll(&app, &sub).await;
             }
-        }
-        if changed {
-            app.save().await;
         }
     }
 }
 
-/// One look at a subscription's channel; returns its moved cursor when anything new was seen.
-async fn poll(app: &Arc<App>, mut sub: Sub) -> Option<Sub> {
+/// One look at a subscription's channel through `buzz messages get --since`.
+async fn poll(app: &Arc<App>, sub: &Sub) {
+    let ident = sub
+        .identity
+        .as_deref()
+        .and_then(|n| app.identities.by_name(n));
     let argv = vec![
         "messages".into(),
         "get".into(),
@@ -234,31 +338,14 @@ async fn poll(app: &Arc<App>, mut sub: Sub) -> Option<Sub> {
         format!("--since={}", sub.since),
         "--limit=100".into(),
     ];
-    let (ok, text) = run_buzz(app, argv).await;
+    let (ok, text) = run_buzz(app, ident.as_ref(), argv).await;
     if !ok {
         tracing::warn!(sub = %sub.id, "poll of {}: {text}", sub.channel);
-        return None;
+        return;
     }
-    let events: Vec<Value> = serde_json::from_str(&text).ok()?;
-    let mut moved = false;
-    for e in &events {
-        let id = e.get("id").and_then(Value::as_str).unwrap_or("").to_owned();
-        let at = e.get("created_at").and_then(Value::as_u64).unwrap_or(0);
-        if id.is_empty() || at < sub.since || (at == sub.since && sub.seen.contains(&id)) {
-            continue;
-        }
-        if at > sub.since {
-            sub.since = at;
-            sub.seen.clear();
-        }
-        sub.seen.push(id.clone());
-        moved = true;
-        if let Some(text) = describe(e, &sub, app.me.as_deref()) {
-            let author = e.get("pubkey").and_then(Value::as_str).unwrap_or("");
-            send_event_for(app, &sub, text, false, Some((&id, author))).await;
-        }
+    if let Ok(events) = serde_json::from_str::<Vec<Value>>(&text) {
+        accept(app, &sub.group_id, &sub.id, &events).await;
     }
-    moved.then_some(sub)
 }
 
 /// The event text for one message, or None when this subscription does not want it.
@@ -322,6 +409,7 @@ mod tests {
             since: 0,
             seen: vec![],
             expires: u64::MAX,
+            identity: None,
         }
     }
 

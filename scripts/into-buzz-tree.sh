@@ -38,6 +38,8 @@ path = "src/main.rs"
 # The command tree the toolset is generated from
 buzz-cli = { path = "../buzz-cli" }
 clap = { version = "4", features = ["derive", "env"] }
+# Push subscriptions: the relay WebSocket client
+buzz-ws-client = { path = "../buzz-ws-client" }
 
 # HTTP server for the manifest and invocations, client for callbacks
 axum = { workspace = true }
@@ -50,8 +52,15 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
-# Our own public key, so a subscription does not echo the agent's own posts
+# Agent identities: keys, and the public keys a subscription drops its own posts by
 nostr = { workspace = true }
+# The identities file
+toml = "0.9"
+
+[dev-dependencies]
+# A stand-in relay WebSocket for the push tests
+axum = { workspace = true }
+futures-util = { workspace = true }
 TOML
 
 if ! grep -q '"crates/buzz-rap"' "$buzz/Cargo.toml"; then

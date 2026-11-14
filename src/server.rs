@@ -1,8 +1,10 @@
 //! HTTP side: the manifest, invocations, callbacks, and the state that makes delivery at-least-once safe.
 
 use crate::audit;
+use crate::identity::{Identities, Identity};
 use crate::subscribe::{self, Sub};
 use crate::toolset::{self, ToolSpec};
+use crate::watch;
 use crate::Args;
 use anyhow::Result;
 use axum::extract::State;
@@ -49,7 +51,11 @@ pub struct App {
     pub tools: HashMap<String, ToolSpec>,
     pub manifest: Value,
     pub http: reqwest::Client,
-    pub me: Option<String>,
+    pub identities: Identities,
+    /// the relay's WebSocket URL when subscriptions are pushed; None = polled
+    pub relay_ws: Option<String>,
+    /// one push watcher per identity name
+    pub watchers: Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<watch::Cmd>>>,
     pub state: Mutex<Persisted>,
     /// dedupe keys whose tool is still running
     pub running: Mutex<std::collections::HashSet<String>>,
@@ -75,7 +81,12 @@ impl App {
     }
 }
 
-pub async fn serve(args: Args, tools: Vec<ToolSpec>, me: Option<String>) -> Result<()> {
+pub async fn serve(
+    args: Args,
+    tools: Vec<ToolSpec>,
+    identities: Identities,
+    relay_ws: Option<String>,
+) -> Result<()> {
     let base = args
         .public_url
         .clone()
@@ -108,7 +119,9 @@ pub async fn serve(args: Args, tools: Vec<ToolSpec>, me: Option<String>) -> Resu
         http: reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()?,
-        me,
+        identities,
+        relay_ws,
+        watchers: Mutex::new(HashMap::new()),
         state: Mutex::new(persisted),
         running: Mutex::new(Default::default()),
         audit_lock: Mutex::new(()),
@@ -131,7 +144,10 @@ async fn manifest_route(State(app): State<Arc<App>>) -> Json<Value> {
 
 async fn health_route(State(app): State<Arc<App>>) -> Json<Value> {
     let s = app.state.lock().await;
-    Json(json!({"ok": true, "tools": app.tools.len() + 2, "subscriptions": s.subs.len()}))
+    Json(
+        json!({"ok": true, "tools": app.tools.len() + 2, "subscriptions": s.subs.len(),
+        "identities": app.identities.len(), "delivery": if app.relay_ws.is_some() { "push" } else { "poll" }}),
+    )
 }
 
 fn authorized(app: &App, headers: &HeaderMap) -> bool {
@@ -159,7 +175,10 @@ async fn invoke_route(
     headers: HeaderMap,
     Json(inv): Json<Invocation>,
 ) -> (StatusCode, Json<Value>) {
-    let who = json!({"group_id": inv.group_id, "id": inv.id, "call_id": inv.call_id, "operation": inv.operation, "callback": audit::origin(&inv.callback_url)});
+    let ident = app.identities.for_group(&inv.group_id);
+    let who = json!({"group_id": inv.group_id, "id": inv.id, "call_id": inv.call_id, "operation": inv.operation,
+        "callback": audit::origin(&inv.callback_url),
+        "identity": ident.as_ref().map(|i| i.pubkey.clone()), "identity_name": ident.as_ref().map(|i| i.name.clone())});
     if !authorized(&app, &headers) {
         let mut e = who.clone();
         e["reason"] = json!("bad or missing bearer token");
@@ -212,9 +231,9 @@ async fn invoke_route(
             .get(&inv.operation)
             .and_then(|t| toolset::argv(t, &inv.arguments).ok());
         let (ok, text) = match inv.operation.as_str() {
-            subscribe::SUBSCRIBE => subscribe::start(&app, &inv).await,
+            subscribe::SUBSCRIBE => subscribe::start(&app, &inv, ident.as_ref()).await,
             subscribe::UNSUBSCRIBE => subscribe::stop(&app, &inv).await,
-            op => run_tool(&app, &app.tools[op], &inv.arguments).await,
+            op => run_tool(&app, ident.as_ref(), &app.tools[op], &inv.arguments).await,
         };
         let body = result_body(&inv, ok, &text);
         {
@@ -252,20 +271,37 @@ pub fn result_body(inv: &Invocation, ok: bool, text: &str) -> Value {
     json!({"type": "tool_result", "group_id": inv.group_id, "id": inv.id, "call_id": inv.call_id, "text": text, "is_error": !ok})
 }
 
-async fn run_tool(app: &App, tool: &ToolSpec, arguments: &Value) -> (bool, String) {
+async fn run_tool(
+    app: &App,
+    ident: Option<&Arc<Identity>>,
+    tool: &ToolSpec,
+    arguments: &Value,
+) -> (bool, String) {
     match toolset::argv(tool, arguments) {
-        Ok(argv) => run_buzz(app, argv).await,
+        Ok(argv) => run_buzz(app, ident, argv).await,
         Err(e) => (false, format!("{e:#}")),
     }
 }
 
-/// Run `buzz` with these arguments; JSON output, no stdin, killed at the timeout.
-pub async fn run_buzz(app: &App, argv: Vec<String>) -> (bool, String) {
+/// Run `buzz` with these arguments as `ident` (or with the inherited credential when None); JSON output, no
+/// stdin, killed at the timeout.
+pub async fn run_buzz(
+    app: &App,
+    ident: Option<&Arc<Identity>>,
+    argv: Vec<String>,
+) -> (bool, String) {
     let mut cmd = tokio::process::Command::new(&app.args.buzz_bin);
     cmd.args(&argv)
         .env("BUZZ_OUTPUT_FORMAT", "json")
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
+    if let Some(i) = ident {
+        cmd.env("BUZZ_PRIVATE_KEY", &i.secret_hex);
+        match &i.auth_tag {
+            Some(t) => cmd.env("BUZZ_AUTH_TAG", t),
+            None => cmd.env_remove("BUZZ_AUTH_TAG"),
+        };
+    }
     let timeout = Duration::from_secs(app.args.tool_timeout_s.max(1));
     match tokio::time::timeout(timeout, cmd.output()).await {
         Err(_) => (

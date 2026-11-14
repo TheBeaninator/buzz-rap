@@ -18,6 +18,8 @@ path = "src/main.rs"
 # upstream main. In the Buzz workspace this line becomes a path dependency (scripts/into-buzz-tree.sh).
 buzz-cli = { git = "https://github.com/TheBeaninator/buzz", rev = "6f9e216e1e0d03820b56bf7e4886acbfad54af9e" }
 clap = { version = "4", features = ["derive", "env"] }
+# Push subscriptions: Buzz's own NIP-42 WebSocket client, from the same commit
+buzz-ws-client = { git = "https://github.com/TheBeaninator/buzz", rev = "6f9e216e1e0d03820b56bf7e4886acbfad54af9e" }
 
 # HTTP server for the manifest and invocations, client for callbacks
 axum = { version = "0.8", features = ["macros"] }
@@ -30,5 +32,12 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Our own public key, so a subscription does not echo the agent's own posts
+# Agent identities: keys, and the public keys a subscription drops its own posts by
 nostr = "0.44"
+# The identities file
+toml = "0.9"
+
+[dev-dependencies]
+# A stand-in relay WebSocket for the push tests
+axum = { version = "0.8", features = ["macros", "ws"] }
+futures-util = "0.3"

@@ -12,8 +12,8 @@ BUZZ_RELAY_URL=https://relay.example BUZZ_PRIVATE_KEY=nsec1... buzz-rap --listen
 curl -s http://127.0.0.1:7171/.well-known/rap-toolset | jq '.tools[].name'
 ```
 
-It runs the `buzz` binary for every tool, so `buzz` must be on `PATH` (or name it with `--buzz-bin`). The
-identity in `BUZZ_PRIVATE_KEY` needs to be a member of the channels the agent works in.
+It runs the `buzz` binary for every tool, so `buzz` must be on `PATH` (or name it with `--buzz-bin`). Each
+agent identity needs to be a member of the channels its agent works in.
 
 ## With FreeFitty
 
@@ -66,14 +66,46 @@ runs the in-tree form against block/buzz main as well.
   conversation (`group_id`) gets the first result again, and the command is not run a second time. Answered
   ids are kept in `--state` across restarts.
 - **`buzz_subscribe`** watches a channel, optionally one thread or mentions only, and posts each new message as
-  a `subscription_event` for the subscribing call. The agent's own messages are skipped, which is why subscriptions
-  need `BUZZ_PRIVATE_KEY` (without it a reply would wake the agent in a loop). A subscription ends with `buzz_unsubscribe` or after `hours` (24 by default, at most 720), with a
-  final event. Subscriptions are kept in `--state` and resume after a restart.
+  a `subscription_event` for the subscribing call. With `BUZZ_RELAY_URL` set, messages are pushed: one
+  authenticated relay WebSocket per identity carries a NIP-01 `REQ` per subscription, so a message arrives as
+  soon as the relay stores it. A dropped connection is re-made with backoff and each subscription is asked
+  again from its own cursor, so nothing is lost. Without a relay URL (or with `--delivery poll`) it polls
+  `buzz messages get` instead. The agent's own messages are skipped, which is why subscriptions need a known
+  identity (without one a reply would wake the agent in a loop). A subscription ends with `buzz_unsubscribe`,
+  after `hours` (24 by default, at most 720), or when the relay closes it, always with a final event.
+  Subscriptions are kept in `--state` and resume after a restart.
+
+## Many agents, one process
+
+An identities file maps RAP conversations to keys, so one server signs as each agent:
+
+```toml
+[[identity]]
+name = "scout"
+key_file = "/etc/buzz-rap/scout.key"   # nsec1... or 64 hex characters; chmod 600
+groups = ["scout", "scout.*"]          # group_id patterns: exact, or a trailing * for a prefix
+
+[[identity]]
+name = "reviewer"
+key_env = "REVIEWER_KEY"
+groups = ["review-*"]
+auth_tag_file = "/etc/buzz-rap/reviewer.auth"   # optional NIP-OA tag (what buzz takes in BUZZ_AUTH_TAG)
+```
+
+```sh
+buzz-rap --identities identities.toml     # BUZZ_PRIVATE_KEY, if set, is the identity for every other conversation
+```
+
+The first entry whose pattern matches a call's `group_id` decides who acts. Its commands run with that key,
+its subscriptions read through that identity's own relay connection, and the relay and the audit log both see
+that agent. With FreeFitty, a goldfish's thread id starts with its elephant's (`scout.gf-...`), so `scout.*`
+gives an agent's helpers the agent's identity. A conversation that matches no entry and has no default is
+refused a subscription.
 
 ## Audit trail
 
-Every action is signed by the server's one identity, so the relay alone cannot say which agent asked for it.
-The audit log closes that gap. It has one JSON line per event, keyed by the calling conversation (`group_id`)
+The relay sees which key signed an action. With several conversations sharing one identity, it cannot say
+which of them asked. The audit log closes that gap. It has one JSON line per event, keyed by the calling conversation (`group_id`)
 and call (`id`, `call_id`):
 
 - `call`: operation, arguments, the `buzz` argv, ok, duration, result size and head, and the `event_ids` the
@@ -100,7 +132,9 @@ own transcript holds the same call ids and event ids, so the trace also runs fro
 | `--allow` | `BUZZ_RAP_ALLOW` | read, search and post commands; nothing that deletes, archives, moderates or changes identity |
 | `--token` | `BUZZ_RAP_TOKEN` | none; required when listening beyond loopback, since the server posts to any callback URL it is given |
 | `--state` | `BUZZ_RAP_STATE` | none (in memory only) |
-| `--poll-ms` | `BUZZ_RAP_POLL_MS` | `2000` |
+| `--identities` | `BUZZ_RAP_IDENTITIES` | none; `BUZZ_PRIVATE_KEY` is the one identity |
+| `--delivery` | `BUZZ_RAP_DELIVERY` | `auto`: push when `BUZZ_RELAY_URL` is set, else poll; or `push`, `poll` |
+| `--poll-ms` | `BUZZ_RAP_POLL_MS` | `2000` (poll delivery, and the expiry check) |
 | `--audit-log` | `BUZZ_RAP_AUDIT_LOG` | none; lines still go to the `buzz_rap::audit` tracing target |
 | `--tool-timeout-s` | `BUZZ_RAP_TOOL_TIMEOUT_S` | `120` |
 
@@ -114,10 +148,9 @@ own transcript holds the same call ids and event ids, so the trace also runs fro
 
 ## Limits
 
-- Subscriptions poll `buzz messages get` every `--poll-ms`. A relay push subscription would remove the
-  latency and the per-poll process.
-- One identity per server. Run one `buzz-rap` per agent identity. The audit log says which conversation asked;
-  the relay sees the server's key.
+- Commands still run one `buzz` process per call; only subscriptions use a long-lived connection.
+- Identities are read at start; changing the file means a restart. Membership is not managed here: add each
+  identity to its channels with Buzz itself.
 
 ## Development
 

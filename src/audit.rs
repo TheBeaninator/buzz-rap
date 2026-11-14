@@ -21,7 +21,6 @@ pub async fn record(app: &App, kind: &str, mut entry: Value) {
         .unwrap_or(0);
     entry["ts_ms"] = json!(ts);
     entry["kind"] = json!(kind);
-    entry["identity"] = json!(app.me);
     let line = entry.to_string();
     tracing::info!(target: "buzz_rap::audit", "{line}");
     let Some(path) = &app.args.audit_log else {
