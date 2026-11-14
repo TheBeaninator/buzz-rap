@@ -225,6 +225,12 @@ async fn a_freefitty_thread_lives_in_a_channel() {
         "one reply: {calls}"
     );
 
+    // the audit line is written once the command has finished, a moment after the stand-in logged its start
+    until("the reply's audit line", 10, || {
+        read(&audit).contains(r#""operation":"buzz_messages_send""#)
+            && read(&audit).contains(r#""kind":"call""#)
+    })
+    .await;
     let lines: Vec<Value> = read(&audit)
         .lines()
         .filter_map(|l| serde_json::from_str(l).ok())
