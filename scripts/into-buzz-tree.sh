@@ -34,6 +34,10 @@ description = "The buzz CLI as a RAP (Reactive Agent Protocol) tool server"
 name = "buzz-rap"
 path = "src/main.rs"
 
+[[bin]]
+name = "buzz-beekeeper"
+path = "src/beekeeper/main.rs"
+
 [dependencies]
 # The command tree the toolset is generated from
 buzz-cli = { path = "../buzz-cli" }
@@ -56,6 +60,8 @@ tracing-subscriber = { workspace = true }
 nostr = { workspace = true }
 # The identities file
 toml = "0.9"
+# buzz-beekeeper: the P-256 recipient key the app seals key backups to
+p256 = { version = "0.13", default-features = false, features = ["arithmetic"] }
 
 [dev-dependencies]
 # A stand-in relay WebSocket for the push tests

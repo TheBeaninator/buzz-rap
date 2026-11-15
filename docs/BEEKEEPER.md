@@ -89,7 +89,7 @@ The key is sealed on the phone with HPKE to a recipient key the service names, a
 |---|---|---|
 | `/v1/buzz/nsec-backups/enrollment` | `{}` | `version` = 1, `suite` = `{kem_id: 16, kdf_id: 1, aead_id: 2}` (DHKEM P-256, HKDF-SHA256, AES-256-GCM), `recipient_public_key` (base64url, 65-byte uncompressed P-256 point), `recipient_key_id`, `service_namespace`, `owner_id` (each 1-255 bytes, no control characters), `backup_id` (UUID), `nostr_pubkey` (the bound key) |
 | `/v1/buzz/nsec-backups` | the envelope: the enrollment's `version`, `suite`, `recipient_key_id`, `service_namespace`, `owner_id`, `backup_id`, `nostr_pubkey`, plus `enc` (65-byte point) and `ciphertext` (48 bytes: the 32-byte key and a 16-byte tag), both base64url without padding | `stored: true`, `backup_id` (the same) |
-| `/v1/buzz/nsec-backups/recovery` | (recovery on a new phone) | to read in the recovery flow if it is wanted |
+| `/v1/buzz/nsec-backups/recovery` | `{}` (recovery on a new phone) | `backups: [{secret_key, backup_id, nostr_pubkey}]` (`secret_key` = the opened 32-byte key, base64url without padding; the app derives the public key and checks it equals `nostr_pubkey`) and `failed_backup_ids: [...]` (any entry blocks recovery). Only a service that opens backups can answer it |
 
 The associated data is `"buzz/nsec-backup/aad/v1"`, the bytes `01 00 10 00 01 00 02`, then
 `recipient_key_id`, `service_namespace` and `owner_id`, each as a 2-byte length and the UTF-8 bytes, then the
@@ -102,7 +102,7 @@ The associated data is `"buzz/nsec-backup/aad/v1"`, the bytes `01 00 10 00 01 00
 |---|---|---|
 | `/v1/buzz/known-communities/add` | `community_url` | no `error` field |
 | `/v1/buzz/known-communities/list` | `{}` | `communities: [{community_url}]` (may be omitted when empty); only `wss://` URLs on the configured relay domains are used |
-| `/v1/buzz/communities/joined` | `{}` | `communities: [...]`, rows may carry `archived_at` (ISO string) and are re-validated; discovery never grants admission |
+| `/v1/buzz/communities/joined` | `{}` | `communities: [{normalized_host, name}]` (required, even when empty); `normalized_host` is a bare host (or `wss://` URL) on port 443 with no path, `name` non-empty; rows with `archived_at` (ISO string) are skipped. Discovery never grants admission |
 | `/v1/buzz/identity/assertions` | `relay_url`, `nostr_pubkey`, NIP-98 signed | NIP-FI assertion, used only for relays whose NIP-FI discovery requires one; a relay that does not get none |
 
 ## 5. The agent registry (beekeeper)
@@ -223,8 +223,22 @@ The service runs each agent on a RAP runtime instead (FreeFitty is the reference
 The policy event's `runtime` tag (`block.builderlab/builderlab`) is what the stock app writes; the self-hosted
 runtime recognizes its agents by the registry, not by that tag.
 
-## 10. Still to read before implementing
+## 10. Status strings
 
-- The recovery flow's request and response (`/v1/buzz/nsec-backups/recovery`), if recovery from the service is wanted.
-- The exact `communities/joined` row fields beyond `archived_at`, from `hosted_communities.dart`.
-- Whether the desktop app needs anything beyond the six beekeeper routes for the same agents.
+The client accepts a number or any string ending in `_<NAME>`. buzz-beekeeper answers with these strings:
+`REGISTER_AGENT_STATUS_UNATTESTED`, `ATTEST_AGENT_STATUS_ACTIVE`, `LIST_AGENTS_STATUS_SUCCESS`,
+`DELETE_AGENT_STATUS_DELETED` / `DELETE_AGENT_STATUS_NOT_FOUND`, per agent `BEEKEEPER_AGENT_STATUS_ACTIVE` /
+`BEEKEEPER_AGENT_STATUS_UNATTESTED`, and `MODEL_SELECTION_STATUS_VALID` (or `_UNSPECIFIED` / `_INVALID`, which
+the app treats as not valid). For `delete-agent` the client compares the exact strings
+`DELETE_AGENT_STATUS_DELETED`, `_NOT_FOUND` and `_DISABLED`, not just the suffix.
+
+## 11. The implementation in this repository
+
+`buzz-beekeeper` (`src/beekeeper/`, README "Agent service") implements sections 2-7: sign-in, binding with the
+owner allowlist, the six beekeeper routes, key-backup enrollment and storage, and the onboarding routes. It
+answers `nsec-backups/recovery` and `identity/assertions` with 404: it never opens backups, and a relay that does
+not require NIP-FI needs no assertion. One sign-in callback is allowed by default, the mobile app's
+`xyz.block.buzz.mobile:/auth/callback`. The sign-in page redirects there at once with only `code` and `state`,
+because the app rejects a callback with any other query field.
+
+Still open: whether the desktop app needs anything beyond the six beekeeper routes for the same agents.

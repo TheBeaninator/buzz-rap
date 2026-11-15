@@ -108,6 +108,43 @@ refused a subscription. An entry's `auth_tag_file` holds its NIP-OA owner tag, w
 author gate lets through. The file is re-read when it changes (every `--identities-reload-s`), so agents can be
 added or removed while the server runs; a file that does not load leaves the previous identities in place.
 
+## Agent service
+
+`buzz-beekeeper`, the crate's second binary, lets the Buzz mobile app create, list, change and delete agents
+on a self-hosted community. It answers the account and agent-registry routes the app calls on its hosted
+service ([docs/BEEKEEPER.md](docs/BEEKEEPER.md)), and listens on loopback behind a TLS reverse proxy:
+
+```sh
+buzz-beekeeper --state-dir /var/lib/beekeeper --owner <community owner pubkey> \
+    --public-origin https://agents.example --models-url http://127.0.0.1:8080 \
+    --community wss://relay.example
+buzz-rap --identities /var/lib/beekeeper/identities.toml
+```
+
+- **Signing in is free; binding is the gate.** Anyone can finish the browser sign-in (PKCE S256), but that
+  session can only bind a Nostr key. Binding takes a kind 24243 event, signed by the key, whose tags match the
+  challenge issued. It succeeds only for keys passed with `--owner`. Every registry, backup and community route
+  needs a session bound to such a key, otherwise it answers 403.
+- **The service mints each agent's key** and keeps it under `<state-dir>/keys` (0600). `register-agent` is
+  idempotent on its `idempotency_key`. `attest-agent` verifies the NIP-OA owner tag against the bound key, runs
+  `--member-add-cmd` (default `buzz-admin add-member --pubkey {pubkey}`) and makes the agent ACTIVE.
+  `delete-agent` runs `--member-remove-cmd` and removes the key files.
+- **Hand-off to the runtime.** On every change the service writes the registry (`<state-dir>/agents.json`:
+  id, pubkey, name, picture, instructions, model, effort, status, owner, owner tag, no secrets) and a buzz-rap
+  identities file with one `[[identity]]` per ACTIVE agent: `name` = agent id, its key file, its owner tag as
+  `auth_tag_file`, and `groups = ["agent-<id>", "agent-<id>.*"]`. Both are written atomically. buzz-rap
+  re-reads the identities file on its own. `--on-change <cmd>` then runs a shell command with
+  `BEEKEEPER_REGISTRY` and `BEEKEEPER_IDENTITIES` set, so the runtime can start or end each agent's
+  conversation (`agent-<id>`) with its instructions and model. The service starts no agent sessions itself.
+- **The model catalog** is the backend's `GET /v1/models`, each id offered with `--efforts` (default
+  `low,medium,high`); `--recommended-model` and `--recommended-effort` pick the suggestion.
+- **Key backups** are stored exactly as the app seals them, to a P-256 recipient key the service generates.
+  The service never opens them; recovery from the service is not offered.
+
+Membership commands get `{pubkey}` and `{agent_id}` substituted (both checked as hex) and
+`BEEKEEPER_AGENT_PUBKEY`, `BEEKEEPER_AGENT_ID` and `BEEKEEPER_COMMUNITY_URL` in the environment. An empty
+command skips the step. Every flag has a `BEEKEEPER_*` environment variable; `buzz-beekeeper --help` lists them.
+
 ## Audit trail
 
 The relay sees which key signed an action. With several conversations sharing one identity, it cannot say

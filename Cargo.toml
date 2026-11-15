@@ -12,6 +12,10 @@ keywords = ["buzz", "nostr", "agents", "rap"]
 name = "buzz-rap"
 path = "src/main.rs"
 
+[[bin]]
+name = "buzz-beekeeper"
+path = "src/beekeeper/main.rs"
+
 [dependencies]
 # The command tree the toolset is generated from. buzz_cli::command() is the one upstream addition buzz-rap needs
 # (patches/0001-buzz-cli-export-command.patch); until block/buzz has it, this pins the commit that adds it on top of
@@ -36,6 +40,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 nostr = "0.44"
 # The identities file
 toml = "0.9"
+# buzz-beekeeper: the P-256 recipient key the app seals key backups to
+p256 = { version = "0.13", default-features = false, features = ["arithmetic"] }
 
 [dev-dependencies]
 # A stand-in relay WebSocket for the push tests
