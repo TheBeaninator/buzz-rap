@@ -51,7 +51,8 @@ pub struct App {
     pub tools: HashMap<String, ToolSpec>,
     pub manifest: Value,
     pub http: reqwest::Client,
-    pub identities: Identities,
+    /// the current identities; swapped whole when the identities file changes
+    pub identities: tokio::sync::RwLock<Arc<Identities>>,
     /// the relay's WebSocket URL when subscriptions are pushed; None = polled
     pub relay_ws: Option<String>,
     /// one push watcher per identity name
@@ -64,6 +65,11 @@ pub struct App {
 }
 
 impl App {
+    /// The identities as of now.
+    pub async fn ids(&self) -> Arc<Identities> {
+        self.identities.read().await.clone()
+    }
+
     pub async fn save(&self) {
         let Some(path) = &self.args.state else { return };
         let body = {
@@ -119,7 +125,7 @@ pub async fn serve(
         http: reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()?,
-        identities,
+        identities: tokio::sync::RwLock::new(Arc::new(identities)),
         relay_ws,
         watchers: Mutex::new(HashMap::new()),
         state: Mutex::new(persisted),
@@ -128,6 +134,7 @@ pub async fn serve(
         args: args.clone(),
     });
     tokio::spawn(subscribe::run(app.clone()));
+    tokio::spawn(reload_identities(app.clone()));
     let router = Router::new()
         .route("/.well-known/rap-toolset", get(manifest_route))
         .route("/invoke", post(invoke_route))
@@ -146,7 +153,7 @@ async fn health_route(State(app): State<Arc<App>>) -> Json<Value> {
     let s = app.state.lock().await;
     Json(
         json!({"ok": true, "tools": app.tools.len() + 2, "subscriptions": s.subs.len(),
-        "identities": app.identities.len(), "delivery": if app.relay_ws.is_some() { "push" } else { "poll" }}),
+        "identities": app.ids().await.len(), "delivery": if app.relay_ws.is_some() { "push" } else { "poll" }}),
     )
 }
 
@@ -175,7 +182,7 @@ async fn invoke_route(
     headers: HeaderMap,
     Json(inv): Json<Invocation>,
 ) -> (StatusCode, Json<Value>) {
-    let ident = app.identities.for_group(&inv.group_id);
+    let ident = app.ids().await.for_group(&inv.group_id);
     let who = json!({"group_id": inv.group_id, "id": inv.id, "call_id": inv.call_id, "operation": inv.operation,
         "callback": audit::origin(&inv.callback_url),
         "identity": ident.as_ref().map(|i| i.pubkey.clone()), "identity_name": ident.as_ref().map(|i| i.name.clone())});
@@ -370,4 +377,32 @@ pub async fn post_callback(app: Arc<App>, url: String, body: Value) -> bool {
     }
     tracing::warn!("callback {url}: no answer after 8 tries; dropped");
     false
+}
+
+/// Re-reads the identities file whenever it changes, so agents added or removed by another tool take effect
+/// without a restart. A file that fails to load leaves the previous identities in place.
+async fn reload_identities(app: Arc<App>) {
+    let Some(path) = app.args.identities.clone() else {
+        return;
+    };
+    let mtime = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let mut seen = mtime(&path);
+    let every = Duration::from_secs(app.args.identities_reload_s.max(1));
+    loop {
+        tokio::time::sleep(every).await;
+        let now = mtime(&path);
+        if now == seen {
+            continue;
+        }
+        seen = now;
+        match Identities::load(Some(&path)) {
+            Ok(ids) => {
+                tracing::info!(identities = ids.len(), "identities file changed; reloaded");
+                *app.identities.write().await = Arc::new(ids);
+            }
+            Err(e) => tracing::warn!(
+                "identities file changed but did not load ({e:#}); keeping the previous ones"
+            ),
+        }
+    }
 }

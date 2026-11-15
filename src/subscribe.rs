@@ -39,18 +39,52 @@ pub struct Sub {
     /// the identity it reads as (an identities-file name, or "default")
     #[serde(default)]
     pub identity: Option<String>,
+    /// `channel` (one channel), `mentions` (messages that mention the identity, in any channel it can read) or
+    /// `dms` (its direct messages)
+    #[serde(default = "scope_channel")]
+    pub scope: String,
+    /// author gate: `owner-only`, `allowlist`, `anyone` or `nobody` (the values Buzz's agent policy uses)
+    #[serde(default = "gate_anyone")]
+    pub respond_to: String,
+    /// extra authors for `allowlist` (hex pubkeys); the owner is always allowed
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// the identity's owner, from its NIP-OA owner tag
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// DM channels found so far (`dms` scope)
+    #[serde(default)]
+    pub dm_channels: Vec<String>,
+}
+
+fn scope_channel() -> String {
+    "channel".into()
+}
+
+fn gate_anyone() -> String {
+    "anyone".into()
+}
+
+const SCOPES: [&str; 3] = ["channel", "mentions", "dms"];
+const GATES: [&str; 4] = ["owner-only", "allowlist", "anyone", "nobody"];
+
+fn is_hex_pubkey(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 pub fn defs() -> Vec<Value> {
     vec![
         json!({"name": SUBSCRIBE,
-            "description": "Watch a channel: every new message there (or in one thread of it) arrives as an event for this call, so you can wait with no timer and wake when someone writes. Your own messages are not sent back. Ends when you call buzz_unsubscribe or after `hours`.",
+            "description": "Watch for messages: in one channel (scope channel), anywhere you are mentioned (scope mentions), or in your direct messages (scope dms). Each new message arrives as an event for this call, so you can wait with no timer and wake when someone writes. Your own messages are not sent back, and messages from authors the gate does not allow are dropped. Ends when you call buzz_unsubscribe or after `hours`.",
             "inputSchema": {"type": "object", "properties": {
-                "channel": {"type": "string", "description": "Channel UUID (from buzz_channels_list)"},
+                "scope": {"type": "string", "enum": SCOPES, "description": "channel (default), mentions or dms"},
+                "channel": {"type": "string", "description": "Channel UUID (from buzz_channels_list); required for scope channel"},
+                "respond_to": {"type": "string", "enum": GATES, "description": "Whose messages to pass on: owner-only (your owner; the default when you have one), allowlist (your owner and `allow`), anyone, or nobody"},
+                "allow": {"type": "array", "items": {"type": "string"}, "description": "Hex pubkeys allowed besides your owner, for respond_to allowlist"},
                 "thread": {"type": "string", "description": "Only messages in the thread with this root event id"},
                 "mentions_only": {"type": "boolean", "description": "Only messages that mention you"},
                 "hours": {"type": "number", "description": "How long to watch; 24 by default, at most 720"}},
-                "required": ["channel"]}}),
+                "required": []}}),
         json!({"name": UNSUBSCRIBE,
             "description": "Stop a subscription made with buzz_subscribe.",
             "inputSchema": {"type": "object", "properties": {
@@ -72,13 +106,17 @@ pub async fn start(
     ident: Option<&Arc<Identity>>,
 ) -> (bool, String) {
     let a = &inv.arguments;
-    let Some(channel) = a
+    let scope = a.get("scope").and_then(Value::as_str).unwrap_or("channel");
+    if !SCOPES.contains(&scope) {
+        return (false, format!("scope must be one of {SCOPES:?}"));
+    }
+    let channel = a
         .get("channel")
         .and_then(Value::as_str)
-        .filter(|c| !c.is_empty())
-    else {
-        return (false, "channel is required".into());
-    };
+        .filter(|c| !c.is_empty());
+    if scope == "channel" && channel.is_none() {
+        return (false, "channel is required for scope channel".into());
+    }
     let Some(ident) = ident else {
         // without its own pubkey the server cannot drop the agent's own posts, and each reply would come back as
         // an event that wakes the agent to reply again
@@ -87,6 +125,40 @@ pub async fn start(
             "subscriptions need a known identity (BUZZ_PRIVATE_KEY or an --identities entry for this conversation): without one the agent's own replies would come back as events and wake it in a loop".into(),
         );
     };
+    if scope != "channel" && app.relay_ws.is_none() {
+        return (false, format!("scope {scope} needs push delivery (BUZZ_RELAY_URL set): polling reads one channel at a time"));
+    }
+    let default_gate = if ident.owner.is_some() {
+        "owner-only"
+    } else {
+        "anyone"
+    };
+    let respond_to = a
+        .get("respond_to")
+        .and_then(Value::as_str)
+        .unwrap_or(default_gate);
+    if !GATES.contains(&respond_to) {
+        return (false, format!("respond_to must be one of {GATES:?}"));
+    }
+    let allow: Vec<String> = a
+        .get("allow")
+        .and_then(Value::as_array)
+        .map(|xs| {
+            xs.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_ascii_lowercase)
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(bad) = allow.iter().find(|p| !is_hex_pubkey(p)) {
+        return (
+            false,
+            format!("allow takes 64-character hex pubkeys, not {bad:?}"),
+        );
+    }
+    if respond_to == "owner-only" && ident.owner.is_none() {
+        return (false, "respond_to owner-only needs an identity with an owner tag (auth_tag_file or BUZZ_AUTH_TAG)".into());
+    }
     let hours = a
         .get("hours")
         .and_then(Value::as_f64)
@@ -96,7 +168,7 @@ pub async fn start(
         id: inv.id.clone(),
         group_id: inv.group_id.clone(),
         callback_url: inv.callback_url.clone(),
-        channel: channel.to_owned(),
+        channel: channel.unwrap_or("").to_owned(),
         thread: a
             .get("thread")
             .and_then(Value::as_str)
@@ -110,28 +182,56 @@ pub async fn start(
         seen: Vec::new(),
         expires: now() + (hours * 3600.0) as u64,
         identity: Some(ident.name.clone()),
+        scope: scope.to_owned(),
+        respond_to: respond_to.to_owned(),
+        allow,
+        owner: ident.owner.clone(),
+        dm_channels: Vec::new(),
     };
-    // the channel must be readable by this identity now, or every delivery would fail quietly
-    let probe = vec![
-        "messages".into(),
-        "get".into(),
-        format!("--channel={channel}"),
-        "--limit=1".into(),
-    ];
-    let (ok, text) = run_buzz(app, Some(ident), probe).await;
-    if !ok {
-        return (false, format!("cannot read channel {channel}: {text}"));
+    if let Some(channel) = channel.filter(|_| scope == "channel") {
+        // the channel must be readable by this identity now, or every delivery would fail quietly
+        let probe = vec![
+            "messages".into(),
+            "get".into(),
+            format!("--channel={channel}"),
+            "--limit=1".into(),
+        ];
+        let (ok, text) = run_buzz(app, Some(ident), probe).await;
+        if !ok {
+            return (false, format!("cannot read channel {channel}: {text}"));
+        }
     }
     let how = if app.relay_ws.is_some() {
         "pushed from the relay"
     } else {
         "polled"
     };
+    let what = match scope {
+        "mentions" => "messages that mention you, in any channel you can read".to_owned(),
+        "dms" => "your direct messages".to_owned(),
+        _ => format!(
+            "channel {}{}{}",
+            sub.channel,
+            sub.thread
+                .as_deref()
+                .map(|t| format!(", thread {t}"))
+                .unwrap_or_default(),
+            if sub.mentions_only {
+                ", mentions only"
+            } else {
+                ""
+            }
+        ),
+    };
     let msg = format!(
-        "Subscribed (subscription {}) to channel {channel}{}{} for {hours} h; new messages are {how} and arrive as events for this call. Reply with buzz_messages_send (reply_to = the event id to answer in its thread). Stop with buzz_unsubscribe.",
+        "Subscribed (subscription {}) to {what} for {hours} h, passing on messages from {}; new messages are {how} and arrive as events for this call. Reply with buzz_messages_send (channel = the event's channel, reply_to = its event id to answer in its thread). Stop with buzz_unsubscribe.",
         sub.id,
-        sub.thread.as_deref().map(|t| format!(", thread {t}")).unwrap_or_default(),
-        if sub.mentions_only { ", mentions only" } else { "" },
+        match sub.respond_to.as_str() {
+            "owner-only" => "your owner only".to_owned(),
+            "allowlist" => format!("your owner and {} other author(s)", sub.allow.len()),
+            "nobody" => "nobody".to_owned(),
+            _ => "anyone".to_owned(),
+        },
     );
     let (group, id) = (sub.group_id.clone(), sub.id.clone());
     app.state.lock().await.subs.push(sub);
@@ -199,6 +299,39 @@ pub async fn relay_closed(app: &Arc<App>, group: &str, id: &str, why: &str) {
     }
 }
 
+/// A DM group event for a `dms` subscription: if it names a DM channel the subscription does not have yet,
+/// remember it and return the updated subscription so its message filter can be widened.
+pub async fn add_dm_channel(app: &Arc<App>, group: &str, id: &str, ev: &Value) -> Option<Sub> {
+    let tags = ev.get("tags").and_then(Value::as_array)?;
+    let is_dm = tags.iter().any(|t| {
+        t.get(0).and_then(Value::as_str) == Some("t")
+            && t.get(1).and_then(Value::as_str) == Some("dm")
+    });
+    let channel = tags
+        .iter()
+        .find(|t| t.get(0).and_then(Value::as_str) == Some("d"))
+        .and_then(|t| t.get(1))
+        .and_then(Value::as_str)?
+        .to_owned();
+    if !is_dm || channel.is_empty() {
+        return None;
+    }
+    let updated = {
+        let mut s = app.state.lock().await;
+        let sub = s
+            .subs
+            .iter_mut()
+            .find(|x| x.group_id == group && x.id == id)?;
+        if sub.dm_channels.contains(&channel) {
+            return None;
+        }
+        sub.dm_channels.push(channel);
+        sub.clone()
+    };
+    app.save().await;
+    Some(updated)
+}
+
 /// Post one event; `from` is the Buzz message it carries (event id, author), recorded in the audit log.
 async fn send_event(
     app: &Arc<App>,
@@ -211,11 +344,8 @@ async fn send_event(
     let delivered = post_callback(app.clone(), sub.callback_url.clone(), body).await;
     let mut e = json!({"group_id": sub.group_id, "subscription": sub.id, "channel": sub.channel, "final": last,
         "delivered": delivered, "identity_name": sub.identity});
-    if let Some(i) = sub
-        .identity
-        .as_deref()
-        .and_then(|n| app.identities.by_name(n))
-    {
+    let ids = app.ids().await;
+    if let Some(i) = sub.identity.as_deref().and_then(|n| ids.by_name(n)) {
         e["identity"] = json!(i.pubkey);
     }
     if let Some((id, author)) = from {
@@ -270,10 +400,11 @@ pub async fn accept(app: &Arc<App>, group: &str, id: &str, events: &[Value]) {
     if fresh.is_empty() {
         return;
     }
+    let ids = app.ids().await;
     let me = sub
         .identity
         .as_deref()
-        .and_then(|n| app.identities.by_name(n))
+        .and_then(|n| ids.by_name(n))
         .map(|i| i.pubkey.clone());
     for e in &fresh {
         if let Some(text) = describe(e, &sub, me.as_deref()) {
@@ -290,12 +421,9 @@ pub async fn run(app: Arc<App>) {
     let every = Duration::from_millis(app.args.poll_ms.max(250));
     // subscriptions kept from before a restart go back to their watchers
     let kept = app.state.lock().await.subs.clone();
+    let ids = app.ids().await;
     for s in &kept {
-        if let Some(i) = s
-            .identity
-            .as_deref()
-            .and_then(|n| app.identities.by_name(n))
-        {
+        if let Some(i) = s.identity.as_deref().and_then(|n| ids.by_name(n)) {
             if let Some(tx) = watch::ensure(&app, &i).await {
                 let _ = tx.send(watch::Cmd::Add(s.group_id.clone(), s.id.clone()));
             }
@@ -327,10 +455,8 @@ pub async fn run(app: Arc<App>) {
 
 /// One look at a subscription's channel through `buzz messages get --since`.
 async fn poll(app: &Arc<App>, sub: &Sub) {
-    let ident = sub
-        .identity
-        .as_deref()
-        .and_then(|n| app.identities.by_name(n));
+    let ids = app.ids().await;
+    let ident = sub.identity.as_deref().and_then(|n| ids.by_name(n));
     let argv = vec![
         "messages".into(),
         "get".into(),
@@ -352,7 +478,7 @@ async fn poll(app: &Arc<App>, sub: &Sub) {
 pub fn describe(e: &Value, sub: &Sub, me: Option<&str>) -> Option<String> {
     let id = e.get("id").and_then(Value::as_str)?;
     let author = e.get("pubkey").and_then(Value::as_str).unwrap_or("");
-    if me == Some(author) {
+    if me == Some(author) || !author_allowed(sub, author) {
         return None;
     }
     let tags: Vec<&Vec<Value>> = e
@@ -388,10 +514,30 @@ pub fn describe(e: &Value, sub: &Sub, me: Option<&str>) -> Option<String> {
         Some(r) => format!("in thread {r}"),
         None => "top level".to_owned(),
     };
+    let channel = tags
+        .iter()
+        .find(|t| tag(t, 0) == "h")
+        .map(|t| tag(t, 1))
+        .unwrap_or_else(|| sub.channel.clone());
+    let kind = if sub.dm_channels.contains(&channel) {
+        "a direct message"
+    } else {
+        "channel"
+    };
     Some(format!(
-        "[buzz] {author} wrote in channel {} ({place}; event {id}):\n{content}",
-        sub.channel
+        "[buzz] {author} wrote in {kind} {channel} ({place}; event {id}):\n{content}"
     ))
+}
+
+/// The author gate (Buzz's agent policy values).
+fn author_allowed(sub: &Sub, author: &str) -> bool {
+    let owner = sub.owner.as_deref() == Some(author);
+    match sub.respond_to.as_str() {
+        "owner-only" => owner,
+        "allowlist" => owner || sub.allow.iter().any(|a| a == author),
+        "nobody" => false,
+        _ => true,
+    }
 }
 
 #[cfg(test)]
@@ -410,6 +556,11 @@ mod tests {
             seen: vec![],
             expires: u64::MAX,
             identity: None,
+            scope: "channel".into(),
+            respond_to: "anyone".into(),
+            allow: vec![],
+            owner: None,
+            dm_channels: vec![],
         }
     }
 

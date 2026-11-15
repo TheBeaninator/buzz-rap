@@ -242,5 +242,43 @@ async fn invoke_dedupe_and_subscribe() {
     assert_eq!(delivered["author"], "them");
     assert_eq!(delivered["subscription"], "call-2");
     assert_eq!(delivered["group_id"], "thread-a");
+    // polling cannot follow mentions across channels: a clear refusal, not a silent subscription
+    let mentions = json!({"operation": "buzz_subscribe", "arguments": {"scope": "mentions"},
+        "id": "call-mentions", "callback_url": cb, "group_id": "thread-a"});
+    assert_eq!(
+        http.post(format!("{base}/invoke"))
+            .json(&mentions)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        202
+    );
+    for _ in 0..50 {
+        if got
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|v| v["id"] == "call-mentions")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let refused = got
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|v| v["id"] == "call-mentions")
+        .cloned()
+        .expect("a result");
+    assert_eq!(refused["is_error"], true);
+    assert!(
+        refused["text"]
+            .as_str()
+            .unwrap()
+            .contains("needs push delivery"),
+        "{refused}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

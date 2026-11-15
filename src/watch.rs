@@ -59,14 +59,73 @@ pub async fn ensure(app: &Arc<App>, ident: &Arc<Identity>) -> Option<mpsc::Unbou
     Some(tx)
 }
 
-async fn req(
+/// Group metadata (NIP-29); DM groups carry `t` = `dm` and a `p` tag per participant.
+pub const GROUP_METADATA_KIND: u32 = 39000;
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Role {
+    /// messages to deliver
+    Messages,
+    /// DM group metadata: each one names a DM channel to listen in
+    DmGroups,
+}
+
+/// The relay filters one subscription needs, as (REQ id, role, filter).
+fn filters(s: &subscribe::Sub, me: &str) -> Vec<(String, Role, Value)> {
+    let rid = req_id(&s.group_id, &s.id);
+    match s.scope.as_str() {
+        "mentions" => vec![(
+            rid,
+            Role::Messages,
+            json!({"kinds": MESSAGE_KINDS, "#p": [me], "since": s.since}),
+        )],
+        "dms" => {
+            let mut v = vec![(
+                format!("{rid}-g"),
+                Role::DmGroups,
+                json!({"kinds": [GROUP_METADATA_KIND], "#t": ["dm"], "#p": [me]}),
+            )];
+            if !s.dm_channels.is_empty() {
+                v.push((
+                    rid,
+                    Role::Messages,
+                    json!({"kinds": MESSAGE_KINDS, "#h": s.dm_channels, "since": s.since}),
+                ));
+            }
+            v
+        }
+        _ => vec![(
+            rid,
+            Role::Messages,
+            json!({"kinds": MESSAGE_KINDS, "#h": [s.channel], "since": s.since}),
+        )],
+    }
+}
+
+type Open = HashMap<String, (String, String, Role)>;
+
+/// Send a subscription's REQs (a repeated REQ id replaces the relay's earlier one).
+async fn ask(
     conn: &mut NostrWsConnection,
-    rid: &str,
-    channel: &str,
-    since: u64,
+    open: &mut Open,
+    s: &subscribe::Sub,
+    me: &str,
 ) -> Result<(), WsClientError> {
-    let filter = json!({"kinds": MESSAGE_KINDS, "#h": [channel], "since": since});
-    conn.send_raw(&json!(["REQ", rid, filter])).await
+    for (rid, role, filter) in filters(s, me) {
+        conn.send_raw(&json!(["REQ", rid, filter])).await?;
+        open.insert(rid, (s.group_id.clone(), s.id.clone(), role));
+    }
+    Ok(())
+}
+
+async fn find(app: &App, group: &str, id: &str) -> Option<subscribe::Sub> {
+    app.state
+        .lock()
+        .await
+        .subs
+        .iter()
+        .find(|s| s.group_id == group && s.id == id)
+        .cloned()
 }
 
 async fn run(
@@ -76,6 +135,7 @@ async fn run(
     mut rx: mpsc::UnboundedReceiver<Cmd>,
 ) {
     let mut fails = 0usize;
+    let me = ident.pubkey.clone();
     loop {
         let mut conn = match NostrWsConnection::connect_authenticated(&url, &ident.keys, None).await
         {
@@ -90,8 +150,7 @@ async fn run(
         };
         fails = 0;
         tracing::info!(identity = %ident.name, "relay {url}: connected for push delivery");
-        // REQ id -> (group, subscription id)
-        let mut open: HashMap<String, (String, String)> = HashMap::new();
+        let mut open: Open = HashMap::new();
         let mine: Vec<subscribe::Sub> = app
             .state
             .lock()
@@ -103,38 +162,33 @@ async fn run(
             .collect();
         let mut broken = false;
         for s in &mine {
-            let rid = req_id(&s.group_id, &s.id);
-            if req(&mut conn, &rid, &s.channel, s.since).await.is_err() {
+            if ask(&mut conn, &mut open, s, &me).await.is_err() {
                 broken = true;
                 break;
             }
-            open.insert(rid, (s.group_id.clone(), s.id.clone()));
         }
         while !broken {
             while let Ok(cmd) = rx.try_recv() {
                 match cmd {
                     Cmd::Add(group, id) => {
-                        let found = app
-                            .state
-                            .lock()
-                            .await
-                            .subs
-                            .iter()
-                            .find(|s| s.group_id == group && s.id == id)
-                            .cloned();
-                        if let Some(s) = found {
-                            let rid = req_id(&group, &id);
-                            if req(&mut conn, &rid, &s.channel, s.since).await.is_err() {
+                        if let Some(s) = find(&app, &group, &id).await {
+                            if ask(&mut conn, &mut open, &s, &me).await.is_err() {
                                 broken = true;
                             }
-                            open.insert(rid, (group, id));
                         }
                     }
                     Cmd::Remove(rid) => {
-                        if open.remove(&rid).is_some()
-                            && conn.send_raw(&json!(["CLOSE", rid])).await.is_err()
-                        {
-                            broken = true;
+                        // a subscription may hold more than one REQ (rid, rid-g)
+                        let gone: Vec<String> = open
+                            .keys()
+                            .filter(|k| **k == rid || k.strip_prefix(rid.as_str()) == Some("-g"))
+                            .cloned()
+                            .collect();
+                        for k in gone {
+                            open.remove(&k);
+                            if conn.send_raw(&json!(["CLOSE", k])).await.is_err() {
+                                broken = true;
+                            }
                         }
                     }
                 }
@@ -147,9 +201,21 @@ async fn run(
                     subscription_id,
                     event,
                 }) => {
-                    if let Some((group, id)) = open.get(&subscription_id) {
-                        let ev: Value = serde_json::to_value(&*event).unwrap_or(Value::Null);
-                        subscribe::accept(&app, group, id, &[ev]).await;
+                    let Some((group, id, role)) = open.get(&subscription_id).cloned() else {
+                        continue;
+                    };
+                    let ev: Value = serde_json::to_value(&*event).unwrap_or(Value::Null);
+                    match role {
+                        Role::Messages => subscribe::accept(&app, &group, &id, &[ev]).await,
+                        Role::DmGroups => {
+                            if let Some(s) = subscribe::add_dm_channel(&app, &group, &id, &ev).await
+                            {
+                                // listen in the new DM channel too, from the subscription's cursor
+                                if ask(&mut conn, &mut open, &s, &me).await.is_err() {
+                                    broken = true;
+                                }
+                            }
+                        }
                     }
                 }
                 Ok(RelayMessage::Closed {
@@ -157,7 +223,7 @@ async fn run(
                     message,
                 }) => {
                     // the relay refused or ended it (membership, a limit): say so to the conversation once
-                    if let Some((group, id)) = open.remove(&subscription_id) {
+                    if let Some((group, id, _)) = open.remove(&subscription_id) {
                         tracing::warn!(identity = %ident.name, "relay closed {subscription_id}: {message}");
                         subscribe::relay_closed(&app, &group, &id, &message).await;
                     }

@@ -31,6 +31,8 @@ pub struct Identity {
     pub secret_hex: String,
     /// passed to `buzz` as BUZZ_AUTH_TAG when set
     pub auth_tag: Option<String>,
+    /// the owner's hex pubkey, read from the NIP-OA owner tag (`["auth", <owner>, <conditions>, <sig>]`)
+    pub owner: Option<String>,
     groups: Vec<String>,
 }
 
@@ -70,9 +72,20 @@ fn make(
         pubkey: keys.public_key().to_hex(),
         secret_hex: keys.secret_key().to_secret_hex(),
         keys,
+        owner: auth_tag.as_deref().and_then(owner_of),
         auth_tag,
         groups,
     })
+}
+
+/// The owner pubkey a NIP-OA owner tag names, if it is well formed.
+pub fn owner_of(tag_json: &str) -> Option<String> {
+    let tag: Vec<String> = serde_json::from_str(tag_json.trim()).ok()?;
+    let owner = tag.get(1)?;
+    (tag.first().map(String::as_str) == Some("auth")
+        && owner.len() == 64
+        && owner.bytes().all(|b| b.is_ascii_hexdigit()))
+    .then(|| owner.to_ascii_lowercase())
 }
 
 /// `scout` matches only `scout`; `scout.*` matches `scout.` followed by anything; `*` matches everything.
@@ -196,6 +209,17 @@ fn warn_if_readable_by_others(_: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owner_from_the_owner_tag() {
+        let o = "a".repeat(64);
+        assert_eq!(
+            owner_of(&format!("[\"auth\",\"{o}\",\"\",\"sig\"]")),
+            Some(o)
+        );
+        assert_eq!(owner_of("[\"auth\",\"short\",\"\",\"s\"]"), None);
+        assert_eq!(owner_of("not json"), None);
+    }
 
     #[test]
     fn patterns() {

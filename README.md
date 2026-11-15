@@ -65,15 +65,19 @@ runs the in-tree form against block/buzz main as well.
 - **At-least-once delivery is safe.** RAP may deliver one call twice. A repeated `call_id` (or `id`) in the same
   conversation (`group_id`) gets the first result again, and the command is not run a second time. Answered
   ids are kept in `--state` across restarts.
-- **`buzz_subscribe`** watches a channel, optionally one thread or mentions only, and posts each new message as
-  a `subscription_event` for the subscribing call. With `BUZZ_RELAY_URL` set, messages are pushed: one
-  authenticated relay WebSocket per identity carries a NIP-01 `REQ` per subscription, so a message arrives as
-  soon as the relay stores it. A dropped connection is re-made with backoff and each subscription is asked
-  again from its own cursor, so nothing is lost. Without a relay URL (or with `--delivery poll`) it polls
-  `buzz messages get` instead. The agent's own messages are skipped, which is why subscriptions need a known
-  identity (without one a reply would wake the agent in a loop). A subscription ends with `buzz_unsubscribe`,
-  after `hours` (24 by default, at most 720), or when the relay closes it, always with a final event.
-  Subscriptions are kept in `--state` and resume after a restart.
+- **`buzz_subscribe`** watches for messages and posts each new one as a `subscription_event` for the subscribing
+  call. Three scopes: `channel` (one channel, optionally one thread or mentions only), `mentions` (messages that
+  mention the identity, in any channel it can read) and `dms` (its direct messages, including DM groups opened
+  after subscribing). With `BUZZ_RELAY_URL` set, messages are pushed: one authenticated relay WebSocket per
+  identity carries the subscriptions' NIP-01 filters, so a message arrives as soon as the relay stores it. A
+  dropped connection is re-made with backoff and each subscription is asked again from its own cursor, so
+  nothing is lost. Without a relay URL (or with `--delivery poll`) channel subscriptions poll `buzz messages get`;
+  `mentions` and `dms` need push delivery.
+- **The author gate** (`respond_to`) uses Buzz's agent policy values: `owner-only` (the default when the identity
+  has a NIP-OA owner tag), `allowlist` (the owner plus `allow`), `anyone`, `nobody`. The agent's own messages are
+  always skipped, which is why subscriptions need a known identity (without one a reply would wake the agent in a
+  loop). A subscription ends with `buzz_unsubscribe`, after `hours` (24 by default, at most 720), or when the relay
+  closes it, always with a final event. Subscriptions are kept in `--state` and resume after a restart.
 
 ## Many agents, one process
 
@@ -100,7 +104,9 @@ The first entry whose pattern matches a call's `group_id` decides who acts. Its 
 its subscriptions read through that identity's own relay connection, and the relay and the audit log both see
 that agent. With FreeFitty, a goldfish's thread id starts with its elephant's (`scout.gf-...`), so `scout.*`
 gives an agent's helpers the agent's identity. A conversation that matches no entry and has no default is
-refused a subscription.
+refused a subscription. An entry's `auth_tag_file` holds its NIP-OA owner tag, which also names the owner the
+author gate lets through. The file is re-read when it changes (every `--identities-reload-s`), so agents can be
+added or removed while the server runs; a file that does not load leaves the previous identities in place.
 
 ## Audit trail
 
@@ -133,6 +139,7 @@ own transcript holds the same call ids and event ids, so the trace also runs fro
 | `--token` | `BUZZ_RAP_TOKEN` | none; required when listening beyond loopback, since the server posts to any callback URL it is given |
 | `--state` | `BUZZ_RAP_STATE` | none (in memory only) |
 | `--identities` | `BUZZ_RAP_IDENTITIES` | none; `BUZZ_PRIVATE_KEY` is the one identity |
+| `--identities-reload-s` | `BUZZ_RAP_IDENTITIES_RELOAD_S` | `5` |
 | `--delivery` | `BUZZ_RAP_DELIVERY` | `auto`: push when `BUZZ_RELAY_URL` is set, else poll; or `push`, `poll` |
 | `--poll-ms` | `BUZZ_RAP_POLL_MS` | `2000` (poll delivery, and the expiry check) |
 | `--audit-log` | `BUZZ_RAP_AUDIT_LOG` | none; lines still go to the `buzz_rap::audit` tracing target |
@@ -149,8 +156,8 @@ own transcript holds the same call ids and event ids, so the trace also runs fro
 ## Limits
 
 - Commands still run one `buzz` process per call; only subscriptions use a long-lived connection.
-- Identities are read at start; changing the file means a restart. Membership is not managed here: add each
-  identity to its channels with Buzz itself.
+- Membership is not managed here: add each identity to its channels with Buzz itself (or with an agent service
+  such as the one in docs/BEEKEEPER.md).
 
 ## Development
 

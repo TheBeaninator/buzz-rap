@@ -51,6 +51,9 @@ pub struct Args {
     /// identities; BUZZ_PRIVATE_KEY stays the default for conversations no entry names
     #[arg(long, env = "BUZZ_RAP_IDENTITIES")]
     pub identities: Option<PathBuf>,
+    /// How often the identities file is checked for changes, in seconds
+    #[arg(long, env = "BUZZ_RAP_IDENTITIES_RELOAD_S", default_value_t = 5)]
+    pub identities_reload_s: u64,
     /// How subscriptions get new messages: push (relay WebSocket), poll (`buzz messages get`), or auto (push
     /// when BUZZ_RELAY_URL is set)
     #[arg(long, env = "BUZZ_RAP_DELIVERY", default_value = "auto", value_parser = ["auto", "push", "poll"])]
