@@ -159,13 +159,21 @@ pub fn page(id: &str, short_code: &str) -> String {
 .code{{font-size:2.6rem;letter-spacing:.3rem;font-weight:700;margin:1rem 0}}#s{{color:#666}}</style></head>
 <body><h1>Approve this sign-in in Buzz</h1>
 <p>A direct message in Buzz asks you to approve sign-in request</p><div class="code">{short_code}</div>
-<p>React 👍 to that message. This page continues on its own.</p><p id="s">Waiting for approval…</p>
+<p>React 👍 to that message, then come back here.</p><p id="s">Waiting for approval…</p>
+<a id="go" href="#" style="display:none;text-align:center;padding:1rem;border-radius:.6rem;background:#1f6feb;color:#fff;font-size:1.2rem;text-decoration:none">Return to Buzz</a>
 <script>
 async function poll(){{
   try {{
     const r = await fetch("/auth/native/status?id={id}", {{cache: "no-store"}});
     const d = await r.json();
-    if (d.state === "approved" && d.redirect) {{ document.getElementById("s").textContent = "Approved."; location.replace(d.redirect); return; }}
+    if (d.state === "approved" && d.redirect) {{
+      // Browsers only open an app link from a tap, so offer one; try the automatic jump too.
+      const go = document.getElementById("go");
+      go.href = d.redirect; go.style.display = "block";
+      document.getElementById("s").textContent = "Approved. Tap the button to return to Buzz.";
+      try {{ location.href = d.redirect; }} catch (e) {{}}
+      return;
+    }}
     if (d.state === "denied") {{ document.getElementById("s").textContent = "Refused. Close this page."; return; }}
     if (d.state === "expired") {{ document.getElementById("s").textContent = "This request expired. Start again from the app."; return; }}
   }} catch (e) {{}}
