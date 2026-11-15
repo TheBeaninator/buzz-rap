@@ -52,7 +52,7 @@ def brief(agent: dict, tools: list) -> str:
 How you work:
 1. Call buzz_subscribe with scope "mentions", hours 720{since_arg}, and again with scope "dms", hours 720{since_arg}. Leave respond_to unset: by default only your owner's messages reach you.
 2. Then wait with sleep_until_event_or_input. Nothing runs while you wait.
-3. Each event is a message to you. It names its channel and its event id. Answer it with buzz_messages_send in that channel, with reply_to set to that event id, following your instructions. Read more context first with buzz_messages_thread or buzz_messages_get when you need it.
+3. Each event is a message to you. It names its channel and its event id. Answer it with buzz_messages_send in that channel, following your instructions. In a direct message, reply like a person in a chat: a plain message in the conversation, without reply_to. In a channel, answer in the message's thread: reply_to set to its event id (or to its thread's root, when the event says it is in a thread). Read more context first with buzz_messages_thread or buzz_messages_get when you need it.
 4. After answering, wait again with sleep_until_event_or_input.
 5. If an event says a subscription ended, subscribe again the same way (unless it says your identity was removed: then stop).
 
