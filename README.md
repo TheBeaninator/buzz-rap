@@ -33,6 +33,13 @@ and it answers with `buzz_messages_send` (`reply_to` = the event id). Other thre
 see the buzz tools, so their prompts are unchanged. `tests/freefitty.rs` runs exactly this with both real
 binaries; CI builds FreeFitty from its repository to run it.
 
+**Agents made in the Buzz apps.** With the agent service (`buzz-beekeeper`, below), run
+`scripts/freefitty-runtime.py` as its `--on-change` command (and on a timer as a safety net). It makes FreeFitty
+match the service's registry: each active agent becomes a thread `agent-<id>` with the buzz tools and a brief
+built from the owner's instructions, subscribed to its mentions and DMs; its Buzz profile is published with its
+own key and owner tag so the apps list it as the owner's; edited instructions reach the thread; a deleted agent's
+thread is removed, and buzz-rap ends its subscriptions when its identity leaves the identities file.
+
 Other RAP runtimes work the same way: read the manifest, post invocations to its endpoint, take results and
 events on the callback URL.
 

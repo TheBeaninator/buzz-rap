@@ -399,6 +399,7 @@ async fn reload_identities(app: Arc<App>) {
             Ok(ids) => {
                 tracing::info!(identities = ids.len(), "identities file changed; reloaded");
                 *app.identities.write().await = Arc::new(ids);
+                subscribe::drop_orphans(&app).await;
             }
             Err(e) => tracing::warn!(
                 "identities file changed but did not load ({e:#}); keeping the previous ones"

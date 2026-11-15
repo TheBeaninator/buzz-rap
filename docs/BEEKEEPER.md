@@ -220,6 +220,9 @@ The service runs each agent on a RAP runtime instead (FreeFitty is the reference
 - **The runtime schedules model time,** so agents queue for slots with everything else the runtime runs, rather
   than each session competing for a slot on its own.
 
+`scripts/freefitty-runtime.py` is the reference runtime for FreeFitty: run as the service's `--on-change`
+command, it starts, retargets and removes one thread per agent and publishes each agent's profile.
+
 The policy event's `runtime` tag (`block.builderlab/builderlab`) is what the stock app writes; the self-hosted
 runtime recognizes its agents by the registry, not by that tag.
 

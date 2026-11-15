@@ -282,6 +282,37 @@ async fn remove(app: &Arc<App>, group: &str, id: &str) -> Option<Sub> {
     removed
 }
 
+/// Ends every subscription whose identity is no longer in the identities file (an agent was deleted), with a
+/// final event, so its mentions and DMs stop at once instead of when the subscription would have expired.
+pub async fn drop_orphans(app: &Arc<App>) {
+    let ids = app.ids().await;
+    let orphans: Vec<(String, String)> = app
+        .state
+        .lock()
+        .await
+        .subs
+        .iter()
+        .filter(|s| {
+            s.identity
+                .as_deref()
+                .is_some_and(|n| ids.by_name(n).is_none())
+        })
+        .map(|s| (s.group_id.clone(), s.id.clone()))
+        .collect();
+    for (group, id) in orphans {
+        if let Some(sub) = remove(app, &group, &id).await {
+            send_event(
+                app,
+                &sub,
+                format!("Subscription {} ended: its identity was removed.", sub.id),
+                true,
+                None,
+            )
+            .await;
+        }
+    }
+}
+
 /// The relay ended a pushed subscription (lost membership, a limit): the conversation hears why, once.
 pub async fn relay_closed(app: &Arc<App>, group: &str, id: &str, why: &str) {
     if let Some(sub) = remove(app, group, id).await {

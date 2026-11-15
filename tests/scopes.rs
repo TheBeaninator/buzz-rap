@@ -365,5 +365,28 @@ async fn mentions_dms_gate_and_identity_reload() {
             .any(|l| l.starts_with(&hex(6)) && l.contains("messages send")),
         "{calls}"
     );
+    // removing the agent's identity ends its subscriptions at once, each with a final event
+    std::fs::write(
+        &ids,
+        format!(
+            "[[identity]]\nname = \"late\"\nkey_file = \"{}\"\ngroups = [\"late\"]\n",
+            late_key.display()
+        ),
+    )
+    .unwrap();
+    until("both subscriptions to end", || {
+        got.lock()
+            .unwrap()
+            .iter()
+            .filter(|v| {
+                v["final"] == true
+                    && v["text"]
+                        .as_str()
+                        .is_some_and(|t| t.contains("identity was removed"))
+            })
+            .count()
+            == 2
+    })
+    .await;
     let _ = std::fs::remove_dir_all(&dir);
 }
