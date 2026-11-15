@@ -141,7 +141,8 @@ def sync(args) -> int:
                 rec["profile"] = profile
             else:
                 failures += 1
-        if prev is not None and prev.get("started") and prev.get("tools", tools_digest) != tools_digest:
+        # a record from before tool tracking means the plain buzz tools
+        if prev is not None and prev.get("started") and prev.get("tools", digest(TOOLS)) != tools_digest:
             # a thread's tool list is fixed when it starts: begin again with the new tools
             ok, out = freefitty(args, "rm", thread)
             if ok:
