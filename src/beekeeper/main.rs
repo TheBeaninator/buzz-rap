@@ -117,7 +117,7 @@ pub struct Args {
     #[arg(long, env = "BUZZ_RELAY_URL", default_value = "http://127.0.0.1:3000")]
     pub buzz_relay_url: String,
     /// How long a sign-in waits for approval, in seconds
-    #[arg(long, env = "BEEKEEPER_APPROVAL_TIMEOUT_S", default_value_t = 300)]
+    #[arg(long, env = "BEEKEEPER_APPROVAL_TIMEOUT_S", default_value_t = 900)]
     pub approval_timeout_s: u64,
 }
 

@@ -154,7 +154,7 @@ command skips the step. Every flag has a `BEEKEEPER_*` environment variable; `bu
 
 **Sign-in approval in Buzz.** Give the service its own Buzz key (`--buzz-key-file`, a relay member) and every
 sign-in comes out unconfirmed: the service DMs each owner in Buzz, and an owner's 👍 on that message binds the
-session to that owner's key (❌ deletes it). This is what lets the app's agent screen work on a community joined
+session to that owner's key (❌, or no answer within 15 minutes, deletes it). This is what lets the app's agent screen work on a community joined
 directly (without hosted onboarding), and it keeps anyone else who reaches the sign-in page out.
 
 ## Audit trail

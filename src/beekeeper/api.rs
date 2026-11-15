@@ -131,6 +131,11 @@ impl App {
         let backup = BackupKey::open(&files.recipient_key)?;
         let mut persisted = files.load_state()?;
         persisted.sessions.retain(|_, s| s.expires > store::now());
+        // an approval's watcher does not outlive the process: a session still waiting can never be confirmed now,
+        // so it goes and the app signs in (and asks) again
+        persisted
+            .sessions
+            .retain(|_, s| s.pending_approval.is_none());
         let registry = files.load_registry()?;
         let app = App {
             http: reqwest::Client::builder()
@@ -321,13 +326,10 @@ impl App {
                         s.pending_approval = None;
                     }
                 }
-                Outcome::Denied => {
-                    inner.persisted.sessions.remove(&k);
-                }
+                // refused, or never answered: the session goes, so the app signs in afresh (and asks again)
+                // instead of holding an unconfirmed session for its whole lifetime
                 _ => {
-                    if let Some(s) = inner.persisted.sessions.get_mut(&k) {
-                        s.pending_approval = None;
-                    }
+                    inner.persisted.sessions.remove(&k);
                 }
             }
         }

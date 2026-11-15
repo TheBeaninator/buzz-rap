@@ -4,7 +4,7 @@
 //! nothing. The service sends each owner a direct message in Buzz from its own identity, naming a short code, and
 //! when an owner reacts 👍 (or ✅, `+`) the session is bound to that owner's key, exactly as a key-binding
 //! challenge would bind it; the reaction is signed by the owner's key on the relay. 👎, ❌ or `-` deletes the
-//! session; no answer within the timeout leaves it unconfirmed.
+//! session, and so does silence until the timeout, so the app signs in again and the owner is asked again.
 
 use serde_json::Value;
 use std::path::PathBuf;

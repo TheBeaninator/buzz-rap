@@ -193,7 +193,7 @@ parameterized-replaceable addressing.
   sign-in approval: with its own Buzz key (`--buzz-key-file`), a sign-in completes at once (the browser leg cannot
   wait: the app cancels it as soon as the user leaves it to answer), but the session it yields is unconfirmed. The
   service DMs each owner a short code, and an owner's 👍 on that message (a reaction signed by the owner's key)
-  binds the waiting session to that key; ❌ deletes it; silence leaves it unconfirmed. The app's next attempt then
+  binds the waiting session to that key; ❌ deletes it, and so does no answer within the timeout (15 minutes), so the app signs in and asks again. The app's next attempt then
   finds the key.
 - Verify every `owner_auth_tag_json` against the session's bound key before activating an agent.
 - Agent secret keys stay on the service host (0600) and never leave it except to the agent's own runtime.
