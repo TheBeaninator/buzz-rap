@@ -159,7 +159,7 @@ cargo test                                           # unit and end-to-end tests
 FREEFITTY_BIN=/path/to/freefitty cargo test --test freefitty   # with the sibling runtime
 ```
 
-[docs/DESIGN.md](docs/DESIGN.md) explains how Buzz is built, where RAP fits, and the choices made here.
+[docs/DESIGN.md](docs/DESIGN.md) explains how Buzz is built, where RAP fits, and the choices made here. [docs/BEEKEEPER.md](docs/BEEKEEPER.md) records the agent-service contract the Buzz apps speak, for running app-created agents on a self-hosted community.
 
 ## License
 
