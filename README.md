@@ -38,7 +38,7 @@ binaries; CI builds FreeFitty from its repository to run it.
 match the service's registry: each active agent becomes a thread `agent-<id>` with the buzz tools and a brief
 built from the owner's instructions, subscribed to its mentions and DMs; its Buzz profile is published with its
 own key and owner tag so the apps list it as the owner's; edited instructions reach the thread; a deleted agent's
-thread is removed, and buzz-rap ends its subscriptions when its identity leaves the identities file.
+thread is removed, and buzz-rap ends its subscriptions when its identity leaves the identities file. Give agents more tools with `--extra-tools` (an opt-in server's tool names); a thread starts again when its tool set changes, since a thread's tool list is fixed at its start. Agents subscribe from their creation time (`since`), so a message sent before the thread is up is still delivered.
 
 Other RAP runtimes work the same way: read the manifest, post invocations to its endpoint, take results and
 events on the callback URL.

@@ -39,18 +39,24 @@ TOOLS = [
 ]
 
 
-def brief(agent: dict) -> str:
+def brief(agent: dict, tools: list) -> str:
     instructions = agent.get("instructions", "").strip() or "(none yet: be helpful and brief)"
+    since = int(agent.get("created_at") or 0)
+    since_arg = f", since {since}" if since else ""
+    extra = [t for t in tools if t not in TOOLS]
+    extra_line = f"\nBesides Buzz you have these tools: {', '.join(extra)}. Use them to answer your owner's questions.\n" if extra else ""
     return f"""You are {agent['name']}, an agent in a Buzz workspace, with your own Buzz identity. Your owner's instructions:
 
 {instructions}
 
 How you work:
-1. Call buzz_subscribe with scope "mentions" and hours 720, and again with scope "dms" and hours 720. Leave respond_to unset: by default only your owner's messages reach you.
+1. Call buzz_subscribe with scope "mentions", hours 720{since_arg}, and again with scope "dms", hours 720{since_arg}. Leave respond_to unset: by default only your owner's messages reach you.
 2. Then wait with sleep_until_event_or_input. Nothing runs while you wait.
 3. Each event is a message to you. It names its channel and its event id. Answer it with buzz_messages_send in that channel, with reply_to set to that event id, following your instructions. Read more context first with buzz_messages_thread or buzz_messages_get when you need it.
 4. After answering, wait again with sleep_until_event_or_input.
-5. If an event says a subscription ended, subscribe again the same way (unless it says your identity was removed: then stop)."""
+5. If an event says a subscription ended, subscribe again the same way (unless it says your identity was removed: then stop).
+
+Your owner reads only what you send with buzz_messages_send. A plain-text reply reaches no one, so never answer in plain text. Notes from the agent service need no reply of their own: act on them and wait.{extra_line}"""
 
 
 def settings_note(agent: dict) -> str:
@@ -59,7 +65,7 @@ def settings_note(agent: dict) -> str:
 
 {instructions}
 
-Keep working as before: answer each message that reaches you, then wait with sleep_until_event_or_input."""
+Keep working as before: answer each message that reaches you with buzz_messages_send (plain text reaches no one), then wait with sleep_until_event_or_input. This note needs no reply."""
 
 
 def digest(*parts) -> str:
@@ -120,6 +126,8 @@ def sync(args) -> int:
         state = {"agents": {}}
     applied = state.setdefault("agents", {})
     active = {a["id"]: a for a in registry.get("agents", []) if a.get("status") == "active"}
+    tools = TOOLS + [t for t in args.extra_tools if t and t not in TOOLS]
+    tools_digest = digest(tools)
     failures = 0
 
     for agent_id, agent in active.items():
@@ -133,10 +141,20 @@ def sync(args) -> int:
                 rec["profile"] = profile
             else:
                 failures += 1
-        if prev is None or not prev.get("started"):
-            ok, out = freefitty(args, "say", "--thread", thread, "--tools", ",".join(TOOLS), brief(agent))
+        if prev is not None and prev.get("started") and prev.get("tools", tools_digest) != tools_digest:
+            # a thread's tool list is fixed when it starts: begin again with the new tools
+            ok, out = freefitty(args, "rm", thread)
             if ok:
-                rec.update(started=True, settings=settings)
+                rec["started"] = False
+                prev = dict(rec)
+                print(f"agent {agent_id}: tools changed; restarting {thread}")
+            else:
+                failures += 1
+                print(f"agent {agent_id}: could not restart for new tools: {out[:300]}", file=sys.stderr)
+        if prev is None or not prev.get("started"):
+            ok, out = freefitty(args, "say", "--thread", thread, "--tools", ",".join(tools), brief(agent, tools))
+            if ok:
+                rec.update(started=True, settings=settings, tools=tools_digest)
                 print(f"agent {agent_id}: thread {thread} started")
             else:
                 failures += 1
@@ -174,6 +192,8 @@ def main() -> int:
     p.add_argument("--freefitty-config", default="freefitty.toml")
     p.add_argument("--buzz", default="buzz", help="the buzz CLI, for publishing agent profiles")
     p.add_argument("--relay-url", default=os.environ.get("BUZZ_RELAY_URL", "http://127.0.0.1:3000"))
+    p.add_argument("--extra-tools", default="", type=lambda s: [t.strip() for t in s.split(",") if t.strip()],
+                   help="more tools every agent gets besides the buzz tools, comma-separated (an opt-in server's)")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
     if not args.registry:

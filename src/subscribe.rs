@@ -19,6 +19,18 @@ pub const SUBSCRIBE: &str = "buzz_subscribe";
 pub const UNSUBSCRIBE: &str = "buzz_unsubscribe";
 const DEFAULT_HOURS: f64 = 24.0;
 const MAX_HOURS: f64 = 24.0 * 30.0;
+/// How far back `since` may reach.
+const MAX_BACKLOG_S: u64 = 7 * 24 * 3600;
+
+/// The cursor a new subscription starts from: `since` if given, never more than a week back, never in the future.
+fn start_cursor(since: Option<f64>, now: u64) -> u64 {
+    match since {
+        Some(t) if t.is_finite() && t > 0.0 => {
+            (t as u64).clamp(now.saturating_sub(MAX_BACKLOG_S), now)
+        }
+        _ => now,
+    }
+}
 /// Largest message text in one event.
 const MAX_EVENT_TEXT: usize = 8 * 1024;
 
@@ -83,7 +95,8 @@ pub fn defs() -> Vec<Value> {
                 "allow": {"type": "array", "items": {"type": "string"}, "description": "Hex pubkeys allowed besides your owner, for respond_to allowlist"},
                 "thread": {"type": "string", "description": "Only messages in the thread with this root event id"},
                 "mentions_only": {"type": "boolean", "description": "Only messages that mention you"},
-                "hours": {"type": "number", "description": "How long to watch; 24 by default, at most 720"}},
+                "hours": {"type": "number", "description": "How long to watch; 24 by default, at most 720"},
+                "since": {"type": "number", "description": "Also pass on messages sent after this time (unix seconds, at most 7 days ago), so nothing sent just before subscribing is missed; now by default"}},
                 "required": []}}),
         json!({"name": UNSUBSCRIBE,
             "description": "Stop a subscription made with buzz_subscribe.",
@@ -178,7 +191,7 @@ pub async fn start(
             .get("mentions_only")
             .and_then(Value::as_bool)
             .unwrap_or(false),
-        since: now(),
+        since: start_cursor(a.get("since").and_then(Value::as_f64), now()),
         seen: Vec::new(),
         expires: now() + (hours * 3600.0) as u64,
         identity: Some(ident.name.clone()),
@@ -611,6 +624,23 @@ mod tests {
         assert!(
             describe(&top, &sub(Some("e1"), false), Some("me")).is_some(),
             "the root itself belongs to its thread"
+        );
+    }
+
+    #[test]
+    fn since_is_bounded() {
+        let now = 1_000_000_000;
+        assert_eq!(start_cursor(None, now), now);
+        assert_eq!(start_cursor(Some((now - 60) as f64), now), now - 60);
+        assert_eq!(
+            start_cursor(Some(1.0), now),
+            now - MAX_BACKLOG_S,
+            "at most a week back"
+        );
+        assert_eq!(
+            start_cursor(Some((now + 99) as f64), now),
+            now,
+            "never in the future"
         );
     }
 

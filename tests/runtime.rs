@@ -18,7 +18,7 @@ fn stand_in(dir: &Path, name: &str, log: &Path) -> PathBuf {
     p
 }
 
-fn sync(dir: &Path, registry: &Path, ff: &Path, buzz: &Path) -> String {
+fn sync(dir: &Path, registry: &Path, ff: &Path, buzz: &Path, extra: &str) -> String {
     let out = Command::new("python3")
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -34,6 +34,7 @@ fn sync(dir: &Path, registry: &Path, ff: &Path, buzz: &Path) -> String {
         .arg(dir.join("freefitty.toml"))
         .arg("--buzz")
         .arg(buzz)
+        .arg(format!("--extra-tools={extra}"))
         .output()
         .expect("python3 runs the runtime script");
     assert!(
@@ -69,7 +70,7 @@ fn agent_life_maps_to_threads_and_profiles() {
 
     // created: profile with the agent's key and owner tag, then the thread with the buzz tools and the brief
     write_registry(&registry, &agent);
-    sync(&dir, &registry, &ff, &buzz);
+    sync(&dir, &registry, &ff, &buzz, "");
     let c = calls();
     let lines: Vec<&str> = c.lines().collect();
     assert_eq!(lines.len(), 2, "{c}");
@@ -86,16 +87,21 @@ fn agent_life_maps_to_threads_and_profiles() {
         lines[1].contains("You are Scout") && lines[1].contains("Be brief."),
         "{c}"
     );
+    assert!(
+        lines[1].contains("since 1"),
+        "subscribe from the agent's creation: {c}"
+    );
+    assert!(lines[1].contains("plain-text reply reaches no one"), "{c}");
 
     // unchanged: nothing to do
-    sync(&dir, &registry, &ff, &buzz);
+    sync(&dir, &registry, &ff, &buzz, "");
     assert_eq!(calls().lines().count(), 2, "a second sync is a no-op");
 
     // edited: the thread hears the new settings; the profile is republished for the new name
     agent["instructions"] = json!("Answer in French.");
     agent["name"] = json!("Scout II");
     write_registry(&registry, &agent);
-    sync(&dir, &registry, &ff, &buzz);
+    sync(&dir, &registry, &ff, &buzz, "");
     let c = calls();
     let new: Vec<&str> = c.lines().skip(2).collect();
     assert_eq!(new.len(), 2, "{c}");
@@ -110,13 +116,41 @@ fn agent_life_maps_to_threads_and_profiles() {
         "a settings note does not reset the tool list"
     );
 
+    // a new tool for every agent: the thread starts again with it (a thread's tool list is fixed at its start)
+    let before = calls().lines().count();
+    sync(&dir, &registry, &ff, &buzz, "board_list,board_read");
+    let c = calls();
+    let new: Vec<&str> = c.lines().skip(before).collect();
+    assert_eq!(new.len(), 2, "{c}");
+    assert!(new[0].contains(" rm agent-a1"), "{c}");
+    assert!(
+        new[1].contains("say --thread agent-a1 --tools buzz_subscribe,")
+            && new[1].contains(",board_list,board_read"),
+        "{c}"
+    );
+    assert!(
+        new[1].contains("board_list, board_read"),
+        "the brief names the extra tools: {c}"
+    );
+    sync(&dir, &registry, &ff, &buzz, "board_list,board_read");
+    assert_eq!(
+        calls().lines().count(),
+        before + 2,
+        "same tools again: no-op"
+    );
+
     // deleted: the thread is removed, once
+    let before = calls().lines().count();
     agent["status"] = json!("deleted");
     write_registry(&registry, &agent);
-    sync(&dir, &registry, &ff, &buzz);
-    sync(&dir, &registry, &ff, &buzz);
+    sync(&dir, &registry, &ff, &buzz, "board_list,board_read");
+    sync(&dir, &registry, &ff, &buzz, "board_list,board_read");
     let c = calls();
-    let removed: Vec<&str> = c.lines().filter(|l| l.contains(" rm agent-a1")).collect();
+    let removed: Vec<&str> = c
+        .lines()
+        .skip(before)
+        .filter(|l| l.contains(" rm agent-a1"))
+        .collect();
     assert_eq!(removed.len(), 1, "{c}");
     let _ = std::fs::remove_dir_all(&dir);
 }
