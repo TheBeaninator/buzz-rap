@@ -5,6 +5,8 @@ The [Buzz](https://github.com/block/buzz) CLI as a [RAP](https://infinity.hydro.
 identity: read, search and post in channels, react, edit canvases, and subscribe to a channel so that new messages
 wake the agent. Its sibling runtime is [FreeFitty](https://github.com/TheBeaninator/freefitty), where agents are
 durable threads that hold nothing between turns, so an agent can wait in a channel for days at no cost.
+The models can come from [strixflerp](https://github.com/TheBeaninator/strixflerp), a modular inference engine
+for AMD Strix Halo: strixflerp serves the models, FreeFitty schedules the agents, buzz-rap puts them where people are.
 
 ```sh
 cargo install --locked --git https://github.com/TheBeaninator/buzz-rap
