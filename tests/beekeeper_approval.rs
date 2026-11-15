@@ -1,6 +1,6 @@
 //! Sign-in approval in Buzz, end to end: buzz-beekeeper with its own Buzz key and a stand-in `buzz` whose
-//! reactions the test controls. The page waits; a stranger's 👍 does nothing; the owner's 👍 approves and the
-//! session comes out bound to the owner's key; ❌ refuses.
+//! reactions the test controls. Sign-in completes at once but the session can do nothing; a stranger's 👍 changes
+//! nothing; the owner's 👍 binds the session to the owner's key; ❌ deletes the session.
 
 use nostr::hashes::Hash;
 use serde_json::{json, Value};
@@ -41,18 +41,67 @@ fn set_reactions(path: &Path, v: Value) {
     std::fs::write(path, v.to_string()).unwrap();
 }
 
-async fn status(http: &reqwest::Client, base: &str, id: &str) -> Value {
-    http.get(format!("{base}/auth/native/status?id={id}"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap()
+struct Svc {
+    http: reqwest::Client,
+    base: String,
+}
+
+impl Svc {
+    /// The app's sign-in: the browser leg (which must redirect at once), then the code exchange.
+    async fn sign_in(&self, verifier: &str) -> String {
+        let url = format!(
+            "{}/auth/native?returnTo={CALLBACK}&state=s1&code_challenge={}&code_challenge_method=S256",
+            self.base,
+            challenge_of(verifier)
+        );
+        let r = self.http.get(&url).send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 302, "sign-in redirects at once");
+        let loc = r.headers()["location"].to_str().unwrap().to_owned();
+        let code = loc
+            .split("code=")
+            .nth(1)
+            .unwrap()
+            .split('&')
+            .next()
+            .unwrap()
+            .to_owned();
+        let ex: Value = self
+            .http
+            .post(format!("{}/api/goose/v1/auth/login/exchange", self.base))
+            .json(&json!({"code": code, "code_verifier": verifier}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        ex["session_credential"]
+            .as_str()
+            .expect("a session")
+            .to_owned()
+    }
+
+    async fn call(&self, cred: &str, path: &str) -> (u16, Value) {
+        let r = self
+            .http
+            .post(format!("{}/api/goose{path}", self.base))
+            .header("X-BB-Session-Credential", cred)
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        let code = r.status().as_u16();
+        (code, r.json::<Value>().await.unwrap_or(Value::Null))
+    }
+
+    async fn bound_key(&self, cred: &str) -> Value {
+        self.call(cred, "/v1/buzz/nostr-identities/current").await.1["identity"]["pubkey_hex"]
+            .clone()
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sign_in_waits_for_the_owner_in_buzz() {
+async fn sign_in_is_confirmed_by_the_owner_in_buzz() {
     let dir = std::env::temp_dir().join(format!("beekeeper-approval-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -92,48 +141,33 @@ async fn sign_in_waits_for_the_owner_in_buzz() {
             .spawn()
             .unwrap(),
     );
-    let base = format!("http://127.0.0.1:{port}");
-    let http = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap();
+    let svc = Svc {
+        http: reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap(),
+        base: format!("http://127.0.0.1:{port}"),
+    };
     for _ in 0..100 {
-        if http.get(format!("{base}/nope")).send().await.is_ok() {
+        if svc
+            .http
+            .get(format!("{}/nope", svc.base))
+            .send()
+            .await
+            .is_ok()
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // the browser leg shows a waiting page with a code, and the owner gets a message naming it
-    let verifier = "v".repeat(50);
-    let url = format!(
-        "{base}/auth/native?returnTo={CALLBACK}&state=s1&code_challenge={}&code_challenge_method=S256",
-        challenge_of(&verifier)
+    // sign in: done at once, but the session is unconfirmed and the owner is asked in Buzz
+    let cred = svc.sign_in(&"v".repeat(50)).await;
+    assert!(
+        svc.bound_key(&cred).await.is_null(),
+        "unconfirmed: no key yet"
     );
-    let r = http.get(&url).send().await.unwrap();
-    assert_eq!(
-        r.status().as_u16(),
-        200,
-        "the page waits instead of redirecting"
-    );
-    let html = r.text().await.unwrap();
-    let id = html
-        .split("status?id=")
-        .nth(1)
-        .unwrap()
-        .split('"')
-        .next()
-        .unwrap()
-        .to_owned();
-    let code = html
-        .split("class=\"code\">")
-        .nth(1)
-        .unwrap()
-        .split('<')
-        .next()
-        .unwrap()
-        .to_owned();
-    assert_eq!(code.len(), 4);
+    assert_eq!(svc.call(&cred, "/v3/beekeeper/list-agents").await.0, 403);
     for _ in 0..50 {
         if std::fs::read_to_string(&log)
             .unwrap_or_default()
@@ -149,10 +183,9 @@ async fn sign_in_waits_for_the_owner_in_buzz() {
         "{calls}"
     );
     assert!(
-        calls.contains("messages send --channel=dm-1") && calls.contains(&code),
+        calls.contains("messages send --channel=dm-1") && calls.contains("react"),
         "{calls}"
     );
-    assert_eq!(status(&http, &base, &id).await["state"], "waiting");
 
     // a stranger's 👍 changes nothing
     set_reactions(
@@ -160,93 +193,46 @@ async fn sign_in_waits_for_the_owner_in_buzz() {
         json!([{"emoji": "👍", "count": 1, "pubkeys": [stranger]}]),
     );
     tokio::time::sleep(Duration::from_millis(2500)).await;
-    assert_eq!(status(&http, &base, &id).await["state"], "waiting");
+    assert_eq!(svc.call(&cred, "/v3/beekeeper/list-agents").await.0, 403);
 
-    // the owner's 👍 approves: the redirect carries a code whose session is bound to the owner
+    // the owner's 👍 binds the existing session to the owner's key
     set_reactions(
         &reactions,
         json!([{"emoji": "👍", "count": 2, "pubkeys": [stranger, owner]}]),
     );
-    let mut redirect = String::new();
+    let mut bound = false;
     for _ in 0..40 {
-        let s = status(&http, &base, &id).await;
-        if s["state"] == "approved" {
-            redirect = s["redirect"].as_str().unwrap().to_owned();
+        if svc.bound_key(&cred).await == owner {
+            bound = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    assert!(
-        redirect.starts_with(&format!("{CALLBACK}?code=")) && redirect.ends_with("&state=s1"),
-        "{redirect}"
-    );
-    let login_code = redirect
-        .split("code=")
-        .nth(1)
-        .unwrap()
-        .split('&')
-        .next()
-        .unwrap();
-    let ex: Value = http
-        .post(format!("{base}/api/goose/v1/auth/login/exchange"))
-        .json(&json!({"code": login_code, "code_verifier": verifier}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let cred = ex["session_credential"]
-        .as_str()
-        .expect("a session")
-        .to_owned();
-    let post = |path: &str| {
-        http.post(format!("{base}/api/goose{path}"))
-            .header("X-BB-Session-Credential", &cred)
-            .json(&json!({}))
-            .send()
-    };
-    let current: Value = post("/v1/buzz/nostr-identities/current")
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(
-        current["identity"]["pubkey_hex"], owner,
-        "the session is bound to the approver"
-    );
-    let list = post("/v3/beekeeper/list-agents").await.unwrap();
-    assert_eq!(
-        list.status().as_u16(),
-        200,
-        "a bound session may use the registry"
-    );
+    assert!(bound, "the session is bound to the approver");
+    assert_eq!(svc.call(&cred, "/v3/beekeeper/list-agents").await.0, 200);
 
-    // a second sign-in refused with ❌
+    // a second sign-in refused with ❌ loses its session; the approved one is unaffected
     set_reactions(&reactions, json!([]));
-    let r = http.get(&url).send().await.unwrap();
-    let html = r.text().await.unwrap();
-    let id2 = html
-        .split("status?id=")
-        .nth(1)
-        .unwrap()
-        .split('"')
-        .next()
-        .unwrap()
-        .to_owned();
+    let cred2 = svc.sign_in(&"w".repeat(50)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
     set_reactions(
         &reactions,
         json!([{"emoji": "❌", "count": 1, "pubkeys": [owner]}]),
     );
-    let mut denied = false;
+    let mut gone = false;
     for _ in 0..40 {
-        if status(&http, &base, &id2).await["state"] == "denied" {
-            denied = true;
+        if svc
+            .call(&cred2, "/v1/buzz/nostr-identities/current")
+            .await
+            .0
+            == 401
+        {
+            gone = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    assert!(denied);
+    assert!(gone, "a refused sign-in loses its session");
+    assert_eq!(svc.call(&cred, "/v3/beekeeper/list-agents").await.0, 200);
     let _ = std::fs::remove_dir_all(&dir);
 }

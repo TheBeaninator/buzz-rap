@@ -1,9 +1,10 @@
 //! Sign-in approval in Buzz. A sign-in page cannot see the user's key, so on a self-hosted service anyone who can
-//! reach it could sign in. With approval on, the page waits instead of redirecting: the service sends each owner a
-//! direct message in Buzz from its own identity, naming a short code the page also shows, and the sign-in
-//! completes when an owner reacts 👍 (or ✅, `+`) to that message. The reaction is signed by the owner's key on
-//! the relay, so the session that results is bound to that key, exactly as a key-binding challenge would bind it.
-//! 👎, ❌ or `-` refuses; no answer within the timeout expires the request.
+//! reach it could sign in. With approval on, a sign-in still completes at once (the app's browser leg cannot wait:
+//! the user has to leave it to answer), but the session it yields is unconfirmed: it can bind nothing and use
+//! nothing. The service sends each owner a direct message in Buzz from its own identity, naming a short code, and
+//! when an owner reacts 👍 (or ✅, `+`) the session is bound to that owner's key, exactly as a key-binding
+//! challenge would bind it; the reaction is signed by the owner's key on the relay. 👎, ❌ or `-` deletes the
+//! session; no answer within the timeout leaves it unconfirmed.
 
 use serde_json::Value;
 use std::path::PathBuf;
@@ -17,25 +18,13 @@ pub struct BuzzAccess {
     pub key_file: PathBuf,
 }
 
+/// How an approval request ended.
 #[derive(Clone, Debug, PartialEq)]
-pub enum Status {
-    Waiting,
+pub enum Outcome {
     /// approved by this owner key
     Approved(String),
     Denied,
     Expired,
-}
-
-pub struct PendingLogin {
-    pub challenge: String,
-    pub state: String,
-    pub return_to: String,
-    /// the code shown on the page and in the message
-    pub short_code: String,
-    pub status: Status,
-    pub until: Instant,
-    /// the one-use login code, minted when approved
-    pub login_code: Option<String>,
 }
 
 /// What a reaction means.
@@ -127,7 +116,7 @@ pub async fn ask(
         };
         let Some(dm) = dm else { continue };
         let text = format!(
-            "Sign-in request {short_code} for the Buzz agent service. If you are signing in on your phone now and the page shows {short_code}, react 👍 to this message to approve it, or ❌ to refuse. It expires in {minutes} minutes."
+            "A device just signed in to the Buzz agent service (sign-in {short_code}). If that was you, react 👍 to this message to approve it, then open Agents again. React ❌ if it was not you. This request expires in {minutes} minutes."
         );
         match buzz(
             access,
@@ -150,38 +139,32 @@ pub async fn ask(
     events
 }
 
-/// The page the app's browser shows while the request waits: it polls and follows the redirect when approved.
-pub fn page(id: &str, short_code: &str) -> String {
-    format!(
-        r##"<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Approve sign-in</title>
-<style>body{{font-family:system-ui,sans-serif;max-width:28rem;margin:3rem auto;padding:0 1rem;line-height:1.5}}
-.code{{font-size:2.6rem;letter-spacing:.3rem;font-weight:700;margin:1rem 0}}#s{{color:#666}}</style></head>
-<body><h1>Approve this sign-in in Buzz</h1>
-<p>A direct message in Buzz asks you to approve sign-in request</p><div class="code">{short_code}</div>
-<p>React 👍 to that message, then come back here.</p><p id="s">Waiting for approval…</p>
-<a id="go" href="#" style="display:none;text-align:center;padding:1rem;border-radius:.6rem;background:#1f6feb;color:#fff;font-size:1.2rem;text-decoration:none">Return to Buzz</a>
-<script>
-async function poll(){{
-  try {{
-    const r = await fetch("/auth/native/status?id={id}", {{cache: "no-store"}});
-    const d = await r.json();
-    if (d.state === "approved" && d.redirect) {{
-      // Browsers only open an app link from a tap, so offer one; try the automatic jump too.
-      const go = document.getElementById("go");
-      go.href = d.redirect; go.style.display = "block";
-      document.getElementById("s").textContent = "Approved. Tap the button to return to Buzz.";
-      try {{ location.href = d.redirect; }} catch (e) {{}}
-      return;
-    }}
-    if (d.state === "denied") {{ document.getElementById("s").textContent = "Refused. Close this page."; return; }}
-    if (d.state === "expired") {{ document.getElementById("s").textContent = "This request expired. Start again from the app."; return; }}
-  }} catch (e) {{}}
-  setTimeout(poll, 2000);
-}}
-poll();
-</script></body></html>"##
-    )
+/// Message the owners, then watch their messages for a verdict until `timeout`.
+pub async fn decide(
+    access: &BuzzAccess,
+    owners: &[String],
+    short_code: &str,
+    timeout: Duration,
+) -> Outcome {
+    let events = ask(access, owners, short_code, (timeout.as_secs() / 60).max(1)).await;
+    let until = Instant::now() + timeout;
+    while !events.is_empty() && Instant::now() < until {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        for ev in &events {
+            let args = ["reactions".into(), "get".into(), format!("--event={ev}")];
+            let Ok(r) = buzz(access, &args).await else {
+                continue;
+            };
+            if let Some((ok, pk)) = owner_verdict(&r, owners) {
+                return if ok {
+                    Outcome::Approved(pk)
+                } else {
+                    Outcome::Denied
+                };
+            }
+        }
+    }
+    Outcome::Expired
 }
 
 #[cfg(test)]

@@ -153,10 +153,9 @@ Membership commands get `{pubkey}` and `{agent_id}` substituted (both checked as
 command skips the step. Every flag has a `BEEKEEPER_*` environment variable; `buzz-beekeeper --help` lists them.
 
 **Sign-in approval in Buzz.** Give the service its own Buzz key (`--buzz-key-file`, a relay member) and every
-sign-in waits on a page showing a short code while the service DMs each owner in Buzz; an owner's 👍 on that
-message completes the sign-in, and the session is bound to that owner's key. This is what lets the app's agent
-screen work on a community joined directly (without hosted onboarding), and it keeps anyone else who reaches the
-sign-in page out.
+sign-in comes out unconfirmed: the service DMs each owner in Buzz, and an owner's 👍 on that message binds the
+session to that owner's key (❌ deletes it). This is what lets the app's agent screen work on a community joined
+directly (without hosted onboarding), and it keeps anyone else who reaches the sign-in page out.
 
 ## Audit trail
 

@@ -170,6 +170,9 @@ pub struct Session {
     /// the Nostr key this session proved, lowercase hex
     #[serde(default)]
     pub bound: Option<String>,
+    /// the sign-in approval this session waits on (approval in Buzz), until an owner answers
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_approval: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
