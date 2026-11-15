@@ -40,6 +40,20 @@ built from the owner's instructions, subscribed to its mentions and DMs; its Buz
 own key and owner tag so the apps list it as the owner's; edited instructions reach the thread; a deleted agent's
 thread is removed, and buzz-rap ends its subscriptions when its identity leaves the identities file. Give agents more tools with `--extra-tools` (an opt-in server's tool names); a thread starts again when its tool set changes, since a thread's tool list is fixed at its start. Agents subscribe from their creation time (`since`), so a message sent before the thread is up is still delivered.
 
+**Reports to the owner, through their agent.** `scripts/agent-report.py` hands a report (a build result, a
+batch job's outcome, another agent's findings) to one of the owner's agents, which summarizes it for them in its
+direct-message conversation in Buzz. The owner reads it on their phone and can ask the agent follow-up questions
+right there:
+
+```sh
+scripts/agent-report.py --registry /var/lib/beekeeper/agents.json --rap-state /var/lib/buzz-rap/state.json \
+    --agent Scout --from nightly-build --title "build 1432" < report.md
+```
+
+The report goes into the agent's thread as a note rather than as a Buzz message, because agents answer only their
+owner by default. The note asks for a short summary that leads with what needs the owner. The owner's DM channel
+comes from buzz-rap's `--state`.
+
 Other RAP runtimes work the same way: read the manifest, post invocations to its endpoint, take results and
 events on the callback URL.
 

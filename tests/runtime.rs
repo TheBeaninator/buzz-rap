@@ -141,7 +141,13 @@ fn agent_life_maps_to_threads_and_profiles() {
 
     // an image tool: the brief says how to attach what it makes
     let before = calls().lines().count();
-    sync(&dir, &registry, &ff, &buzz, "board_list,board_read,image_generate");
+    sync(
+        &dir,
+        &registry,
+        &ff,
+        &buzz,
+        "board_list,board_read,image_generate",
+    );
     let c = calls();
     let new: Vec<&str> = c.lines().skip(before).collect();
     assert_eq!(new.len(), 2, "{c}");

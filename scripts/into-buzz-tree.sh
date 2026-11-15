@@ -20,7 +20,7 @@ dst="$buzz/crates/buzz-rap"
 rm -rf "$dst"
 mkdir -p "$dst"
 cp -r "$here/src" "$here/tests" "$here/README.md" "$dst/"
-mkdir -p "$dst/scripts" && cp "$here/scripts/freefitty-runtime.py" "$dst/scripts/"
+mkdir -p "$dst/scripts" && cp "$here/scripts/freefitty-runtime.py" "$here/scripts/agent-report.py" "$dst/scripts/"
 cat > "$dst/Cargo.toml" <<'TOML'
 [package]
 name = "buzz-rap"
