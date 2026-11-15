@@ -314,6 +314,36 @@ async fn mentions_dms_gate_and_identity_reload() {
         .iter()
         .any(|(_, t)| t.contains("stranger") || t.contains("unrelated")));
 
+    // subscribing again in the same conversation replaces the earlier subscription (no double delivery)
+    let again = http
+        .post(format!("{base}/invoke"))
+        .json(&invoke(
+            "buzz_subscribe",
+            json!({"scope": "mentions"}),
+            "call-m2",
+            "scout",
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.status(), 202);
+    until("the replacement", || {
+        got.lock().unwrap().iter().any(|v| v["id"] == "call-m2")
+    })
+    .await;
+    let health: Value = http
+        .get(format!("{base}/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        health["subscriptions"], 2,
+        "mentions (replaced) + dms: {health}"
+    );
+
     // an agent added to the identities file while running signs with its own key, no restart
     let late_key = write_key("late.key", 6);
     std::fs::write(

@@ -247,6 +247,24 @@ pub async fn start(
         },
     );
     let (group, id) = (sub.group_id.clone(), sub.id.clone());
+    // one subscription per conversation and target: a conversation that subscribes again (a restarted agent
+    // thread reuses its id) replaces its earlier one, or every message would arrive twice
+    let replaced: Vec<String> = {
+        let s = app.state.lock().await;
+        s.subs
+            .iter()
+            .filter(|x| {
+                x.group_id == sub.group_id
+                    && x.scope == sub.scope
+                    && x.channel == sub.channel
+                    && x.thread == sub.thread
+            })
+            .map(|x| x.id.clone())
+            .collect()
+    };
+    for old in replaced {
+        remove(app, &group, &old).await;
+    }
     app.state.lock().await.subs.push(sub);
     if let Some(tx) = watch::ensure(app, ident).await {
         let _ = tx.send(watch::Cmd::Add(group, id));
