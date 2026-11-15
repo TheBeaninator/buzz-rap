@@ -187,6 +187,12 @@ parameterized-replaceable addressing.
   only pubkeys on its owner allowlist (the community owner), proven by the kind 24243 signature. Every
   registry route requires a session bound to an allowed key. A stranger who completes sign-in cannot bind the
   owner's key, so their session can do nothing.
+- **Or approve sign-ins in Buzz.** The app's agent screen signs in with a login-only "reconnect" and then expects
+  the service to already know the account's key (in a hosted community, onboarding bound it). On a community the
+  user joined directly, nothing bound it, so the screen reports the identity absent. buzz-beekeeper's answer is
+  sign-in approval: with its own Buzz key (`--buzz-key-file`), the sign-in page shows a short code and waits,
+  the service sends each owner a direct message naming that code, and an owner's 👍 on it (a reaction signed by
+  the owner's key) completes the sign-in with the session bound to that key. ❌ refuses; silence expires.
 - Verify every `owner_auth_tag_json` against the session's bound key before activating an agent.
 - Agent secret keys stay on the service host (0600) and never leave it except to the agent's own runtime.
 - Store key backups only as the sealed blobs the client sends.

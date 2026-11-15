@@ -66,6 +66,8 @@ fn internal(e: impl std::fmt::Display) -> ApiErr {
 struct LoginCode {
     challenge: String,
     until: Instant,
+    /// the owner key that approved this sign-in in Buzz, which the session is bound to
+    approved_by: Option<String>,
 }
 
 struct PendingChallenge {
@@ -83,6 +85,8 @@ struct Inner {
     registry: Registry,
     codes: HashMap<String, LoginCode>,
     challenges: HashMap<String, PendingChallenge>,
+    /// sign-ins waiting for approval in Buzz, by page id
+    logins: HashMap<String, crate::approve::PendingLogin>,
 }
 
 pub struct App {
@@ -221,7 +225,7 @@ impl App {
 
     // ---- sign-in ----
 
-    async fn login(&self, q: &HashMap<String, String>) -> Response {
+    async fn login(self: &Arc<Self>, q: &HashMap<String, String>) -> Response {
         let return_to = q.get("returnTo").map(String::as_str).unwrap_or_default();
         let state = q.get("state").map(String::as_str).unwrap_or_default();
         let challenge = q
@@ -244,6 +248,11 @@ impl App {
         if !state_ok {
             return bad("bad state").into_response();
         }
+        if let Some(access) = self.cfg.approval.clone() {
+            return self
+                .login_with_approval(access, challenge, state, return_to)
+                .await;
+        }
         let code = store::token();
         {
             let mut inner = self.inner.lock().await;
@@ -257,6 +266,7 @@ impl App {
                 LoginCode {
                     challenge: challenge.to_owned(),
                     until: now + CODE_TTL,
+                    approved_by: None,
                 },
             );
         }
@@ -269,6 +279,122 @@ impl App {
             ],
         )
             .into_response()
+    }
+
+    /// A sign-in that waits for an owner's 👍 in Buzz: register it, message the owners, return the waiting page.
+    async fn login_with_approval(
+        self: &Arc<Self>,
+        access: crate::approve::BuzzAccess,
+        challenge: &str,
+        state: &str,
+        return_to: &str,
+    ) -> Response {
+        let id = store::token();
+        let short_code = format!(
+            "{:04}",
+            u16::from_le_bytes(store::random_bytes::<2>()) % 10_000
+        );
+        let timeout = Duration::from_secs(self.cfg.args.approval_timeout_s.max(30));
+        {
+            let mut inner = self.inner.lock().await;
+            let now = Instant::now();
+            inner.logins.retain(|_, l| l.until > now);
+            if inner.logins.len() >= MAX_PENDING {
+                return unavailable("too many sign-ins in progress").into_response();
+            }
+            inner.logins.insert(
+                id.clone(),
+                crate::approve::PendingLogin {
+                    challenge: challenge.to_owned(),
+                    state: state.to_owned(),
+                    return_to: return_to.to_owned(),
+                    short_code: short_code.clone(),
+                    status: crate::approve::Status::Waiting,
+                    until: now + timeout,
+                    login_code: None,
+                },
+            );
+        }
+        tracing::info!(code = %short_code, "sign-in waiting for approval in Buzz");
+        let app = self.clone();
+        let (watch_id, owners, code) = (id.clone(), self.cfg.owners.clone(), short_code.clone());
+        tokio::spawn(async move {
+            let events = crate::approve::ask(&access, &owners, &code, timeout.as_secs() / 60).await;
+            let mut status = crate::approve::Status::Expired;
+            let until = Instant::now() + timeout;
+            while !events.is_empty() && Instant::now() < until {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                for ev in &events {
+                    let Ok(r) = crate::approve::buzz(
+                        &access,
+                        &["reactions".into(), "get".into(), format!("--event={ev}")],
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    if let Some((ok, pk)) = crate::approve::owner_verdict(&r, &owners) {
+                        status = if ok {
+                            crate::approve::Status::Approved(pk)
+                        } else {
+                            crate::approve::Status::Denied
+                        };
+                    }
+                }
+                if status != crate::approve::Status::Expired {
+                    break;
+                }
+            }
+            tracing::info!(code = %code, ?status, "sign-in approval finished");
+            if let Some(l) = app.inner.lock().await.logins.get_mut(&watch_id) {
+                l.status = status;
+            }
+        });
+        (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "text/html; charset=utf-8".to_owned()),
+                (header::CACHE_CONTROL, "no-store".to_owned()),
+            ],
+            crate::approve::page(&id, &short_code),
+        )
+            .into_response()
+    }
+
+    /// The waiting page's poll: once approved, a one-use login code bound to the approver, and the callback URL.
+    async fn login_status(&self, id: &str) -> Value {
+        let mut inner = self.inner.lock().await;
+        let now = Instant::now();
+        let Some(l) = inner.logins.get_mut(id) else {
+            return json!({"state": "expired"});
+        };
+        match l.status.clone() {
+            crate::approve::Status::Waiting if l.until > now => {
+                json!({"state": "waiting", "code": l.short_code})
+            }
+            crate::approve::Status::Waiting | crate::approve::Status::Expired => {
+                json!({"state": "expired"})
+            }
+            crate::approve::Status::Denied => json!({"state": "denied"}),
+            crate::approve::Status::Approved(owner) => {
+                let code = match &l.login_code {
+                    Some(c) => c.clone(),
+                    None => {
+                        let c = store::token();
+                        l.login_code = Some(c.clone());
+                        c
+                    }
+                };
+                let redirect = format!("{}?code={code}&state={}", l.return_to, l.state);
+                let challenge = l.challenge.clone();
+                inner.codes.entry(code).or_insert(LoginCode {
+                    challenge,
+                    until: now + CODE_TTL,
+                    approved_by: Some(owner),
+                });
+                json!({"state": "approved", "redirect": redirect})
+            }
+        }
     }
 
     async fn exchange(&self, body: &Value) -> Res {
@@ -307,7 +433,8 @@ impl App {
             Session {
                 subject: self.cfg.args.subject.clone(),
                 expires,
-                bound: None,
+                // approved in Buzz by an owner: bound to that key, as a binding challenge would bind it
+                bound: pending.approved_by.filter(|k| self.cfg.owners.contains(k)),
             },
         );
         self.save_state(&inner)?;
@@ -1043,9 +1170,23 @@ async fn me(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
     }
 }
 
+async fn login_status(
+    State(app): State<Arc<App>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let id = q.get("id").map(String::as_str).unwrap_or_default();
+    (
+        StatusCode::OK,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(app.login_status(id).await),
+    )
+        .into_response()
+}
+
 pub fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/auth/native", get(login))
+        .route("/auth/native/status", get(login_status))
         .route("/api/goose/v1/auth/login", get(login))
         .route("/api/goose/v1/auth/me", get(me))
         .route("/api/goose/{*path}", post(dispatch))

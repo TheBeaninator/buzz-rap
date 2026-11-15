@@ -8,6 +8,7 @@
 //! file so one buzz-rap process signs as every active agent. It never runs agents itself: a RAP runtime does.
 
 mod api;
+mod approve;
 mod check;
 mod store;
 
@@ -105,6 +106,19 @@ pub struct Args {
     /// Most agents one owner may have
     #[arg(long, env = "BEEKEEPER_MAX_AGENTS", default_value_t = 64)]
     pub max_agents: usize,
+    /// The service's own Buzz key (a relay member). With it, every sign-in waits for an owner to approve it in
+    /// Buzz (a 👍 on a direct message from the service), and the session is bound to that owner's key
+    #[arg(long, env = "BEEKEEPER_BUZZ_KEY_FILE")]
+    pub buzz_key_file: Option<PathBuf>,
+    /// The buzz CLI, for approval messages
+    #[arg(long, env = "BEEKEEPER_BUZZ_BIN", default_value = "buzz")]
+    pub buzz_bin: String,
+    /// The relay the approval messages go through
+    #[arg(long, env = "BUZZ_RELAY_URL", default_value = "http://127.0.0.1:3000")]
+    pub buzz_relay_url: String,
+    /// How long a sign-in waits for approval, in seconds
+    #[arg(long, env = "BEEKEEPER_APPROVAL_TIMEOUT_S", default_value_t = 300)]
+    pub approval_timeout_s: u64,
 }
 
 /// Flags checked and normalized.
@@ -114,6 +128,8 @@ pub struct Config {
     pub owners: Vec<String>,
     pub identities: PathBuf,
     pub return_to: Vec<String>,
+    /// sign-in approval in Buzz, when the service has its own key
+    pub approval: Option<approve::BuzzAccess>,
 }
 
 impl Config {
@@ -141,11 +157,20 @@ impl Config {
             .unwrap_or_else(|| args.state_dir.join("identities.toml"));
         let mut return_to = vec![MOBILE_CALLBACK.to_owned()];
         return_to.extend(args.return_to.iter().cloned());
+        let approval = args
+            .buzz_key_file
+            .clone()
+            .map(|key_file| approve::BuzzAccess {
+                bin: args.buzz_bin.clone(),
+                relay_url: args.buzz_relay_url.clone(),
+                key_file,
+            });
         Ok(Config {
             args,
             owners,
             identities,
             return_to,
+            approval,
         })
     }
 }
