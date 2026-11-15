@@ -45,6 +45,9 @@ def brief(agent: dict, tools: list) -> str:
     since_arg = f", since {since}" if since else ""
     extra = [t for t in tools if t not in TOOLS]
     extra_line = f"\nBesides Buzz you have these tools: {', '.join(extra)}. Use them to answer your owner's questions.\n" if extra else ""
+    if "image_generate" in extra:
+        extra_line += ("To show an image you made with image_generate, send its file path in buzz_messages_send's files "
+                       "list (files: [\"<path>\"]) with a short message; the image is uploaded and attached.\n")
     return f"""You are {agent['name']}, an agent in a Buzz workspace, with your own Buzz identity. Your owner's instructions:
 
 {instructions}

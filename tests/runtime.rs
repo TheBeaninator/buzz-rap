@@ -139,6 +139,17 @@ fn agent_life_maps_to_threads_and_profiles() {
         "same tools again: no-op"
     );
 
+    // an image tool: the brief says how to attach what it makes
+    let before = calls().lines().count();
+    sync(&dir, &registry, &ff, &buzz, "board_list,board_read,image_generate");
+    let c = calls();
+    let new: Vec<&str> = c.lines().skip(before).collect();
+    assert_eq!(new.len(), 2, "{c}");
+    assert!(
+        new[1].contains("files: [\"<path>\"]"),
+        "the brief says to attach images with files: {c}"
+    );
+
     // deleted: the thread is removed, once
     let before = calls().lines().count();
     agent["status"] = json!("deleted");
