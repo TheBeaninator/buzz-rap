@@ -8,7 +8,10 @@ Reads the beekeeper registry (agents.json) and makes FreeFitty match it:
 - the agent's Buzz profile (name, picture, and the NIP-OA owner tag the CLI adds from BUZZ_AUTH_TAG) is published
   with the agent's own key, so the apps list the agent as the owner's;
 - changed instructions or a changed name are told to the thread;
-- an agent that is deleted (or no longer ACTIVE) has its thread removed.
+- an agent that is deleted (or no longer ACTIVE) has its thread removed;
+- alerts FreeFitty raises for an agent (a standing duty paused, its runs failing: replies of kind `alert` on the
+  agent's thread) are posted to the agent's direct-message conversation with its owner, with the agent's own key,
+  so the owner hears of them even when the agent's model does not relay them.
 
 It is idempotent: run it from beekeeper's --on-change, and on a timer as a safety net. Nothing here holds a model
 slot: a thread takes a model turn only when buzz-rap delivers a message to it, and sleeps between messages.
@@ -19,6 +22,9 @@ each agent's calls with its own key. Standard library only (Python 3.11+).
 
 import argparse
 import fcntl
+import tomllib
+import urllib.error
+import urllib.request
 import hashlib
 import json
 import os
@@ -38,13 +44,44 @@ TOOLS = [
     "buzz_users_get",
 ]
 
+# FreeFitty's own opt-in tools for long-lived agents (docs/design/standing-work.md in FreeFitty): standing duties,
+# a workspace with a memory file, and hand-offs. A FreeFitty without them offers nothing for these names.
+STANDING = [
+    "routine",
+    "hand_off",
+    "workspace_read",
+    "workspace_list",
+    "workspace_write",
+    "workspace_delete",
+]
+
+STANDING_BRIEF = """
+Standing duties: with the routine tool you keep duties that run while nobody is talking to you (every N minutes, at
+times of day, or after you have been idle). When your owner asks for something regular ("every morning check X",
+"tell me when Y"), add a duty for it. Each firing runs in a short-lived thread of its own with your tools and your
+workspace; it reaches you with hand_off only when something needs you, and its one-line result is kept on the duty.
+routine with action "list" shows your duties, their next run and last result: use it when your owner asks what you
+are doing for them.
+
+Memory: your workspace (workspace_read, workspace_write, workspace_list, workspace_delete) keeps files between
+turns. Keep facts you must not lose in my/MEMORY.md (read it, change it, write it back with if_match). Your duty runs
+can read and write it too.
+
+Hand-off: hand_off gives work to another agent's thread. A message that starts with [Hand-off from ...] is work
+handed to you, and one that starts with [Duty ...] is one of your duties firing in this conversation: act on it,
+tell your owner with buzz_messages_send when it matters, and wait again. A message that starts with [FreeFitty] is a
+notice about your duties (a pause, failing runs): tell your owner in your direct messages, then wait.
+"""
+
 
 def brief(agent: dict, tools: list) -> str:
     instructions = agent.get("instructions", "").strip() or "(none yet: be helpful and brief)"
     since = int(agent.get("created_at") or 0)
     since_arg = f", since {since}" if since else ""
-    extra = [t for t in tools if t not in TOOLS]
+    extra = [t for t in tools if t not in TOOLS and t not in STANDING]
     extra_line = f"\nBesides Buzz you have these tools: {', '.join(extra)}. Use them to answer your owner's questions.\n" if extra else ""
+    if any(t in STANDING for t in tools):
+        extra_line += STANDING_BRIEF
     if "image_generate" in extra:
         extra_line += ("To show an image you made with image_generate, send its file path in buzz_messages_send's files "
                        "list (files: [\"<path>\"]) with a short message; the image is uploaded and attached.\n")
@@ -129,7 +166,7 @@ def sync(args) -> int:
         state = {"agents": {}}
     applied = state.setdefault("agents", {})
     active = {a["id"]: a for a in registry.get("agents", []) if a.get("status") == "active"}
-    tools = TOOLS + [t for t in args.extra_tools if t and t not in TOOLS]
+    tools = TOOLS + ([] if args.no_standing else STANDING) + [t for t in args.extra_tools if t and t not in TOOLS and t not in STANDING]
     tools_digest = digest(tools)
     failures = 0
 
@@ -185,7 +222,85 @@ def sync(args) -> int:
 
     if not args.dry_run:
         write_atomic(args.state, state)
+    if args.rap_state and not args.dry_run:
+        failures += relay_alerts(args, active)
     return 1 if failures else 0
+
+
+def operator_api(args):
+    """FreeFitty's operator API base URL and token, from its config file."""
+    with open(args.freefitty_config, "rb") as f:
+        cfg = tomllib.load(f)
+    listen = cfg.get("listen", "127.0.0.1:8081")
+    return f"http://{listen}", cfg.get("operator_token", "")
+
+
+def pop_reply(base: str, token: str, thread: str):
+    """The oldest uncollected reply of `thread` (FreeFitty removes it as it hands it out), or None."""
+    req = urllib.request.Request(f"{base}/output?thread={thread}&wait=0", headers={"Authorization": f"Bearer {token}"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        if r.status == 204:
+            return None
+        return json.load(r)
+
+
+def dm_channel(rap_state: str, agent_id: str):
+    """The agent's direct-message conversation with its owner, from buzz-rap's subscription state."""
+    try:
+        with open(rap_state) as f:
+            subs = json.load(f).get("subs", [])
+    except (OSError, ValueError):
+        return None
+    for s in subs:
+        if s.get("identity") == agent_id and s.get("scope") == "dms" and s.get("dm_channels"):
+            return s["dm_channels"][0]
+    return None
+
+
+def relay_alerts(args, active: dict) -> int:
+    """Post each active agent's `alert` replies to its owner's DM with the agent's key. Its other replies are plain
+    text the agent wrote outside buzz_messages_send, which reach no one by design: they are collected and dropped,
+    so they do not pile up. An alert that cannot be posted is printed and counted as a failure (FreeFitty has
+    already handed it out; the next run cannot see it again)."""
+    try:
+        base, token = operator_api(args)
+    except (OSError, ValueError) as e:
+        print(f"alerts: cannot read {args.freefitty_config}: {e}", file=sys.stderr)
+        return 1
+    failures = 0
+    for agent_id, agent in active.items():
+        thread = f"agent-{agent_id}"
+        dropped = 0
+        while True:
+            try:
+                reply = pop_reply(base, token, thread)
+            except (urllib.error.URLError, OSError, ValueError) as e:
+                print(f"alerts: FreeFitty not reachable ({e}); trying again next run", file=sys.stderr)
+                return failures
+            if reply is None:
+                break
+            if reply.get("metadata", {}).get("kind") != "alert":
+                dropped += 1
+                continue
+            text = reply.get("text", "")
+            channel = dm_channel(args.rap_state, agent_id)
+            if not channel:
+                failures += 1
+                print(f"agent {agent_id}: alert not posted (no direct-message conversation known yet): {text[:300]}", file=sys.stderr)
+                continue
+            env = dict(os.environ)
+            env["BUZZ_RELAY_URL"] = args.relay_url
+            env["BUZZ_PRIVATE_KEY"] = read_secret(agent["key_file"])
+            env["BUZZ_AUTH_TAG"] = read_secret(agent["auth_tag_file"])
+            ok, out = run([args.buzz, "messages", "send", "--channel", channel, "--content", text], env=env)
+            if ok:
+                print(f"agent {agent_id}: alert posted to its owner")
+            else:
+                failures += 1
+                print(f"agent {agent_id}: alert not posted ({out[:200]}): {text[:300]}", file=sys.stderr)
+        if dropped:
+            print(f"agent {agent_id}: {dropped} plain-text repl{'y' if dropped == 1 else 'ies'} collected (they reach no one)")
+    return failures
 
 
 def main() -> int:
@@ -198,6 +313,9 @@ def main() -> int:
     p.add_argument("--relay-url", default=os.environ.get("BUZZ_RELAY_URL", "http://127.0.0.1:3000"))
     p.add_argument("--extra-tools", default="", type=lambda s: [t.strip() for t in s.split(",") if t.strip()],
                    help="more tools every agent gets besides the buzz tools, comma-separated (an opt-in server's)")
+    p.add_argument("--no-standing", action="store_true", help="leave out FreeFitty's routine, hand_off and workspace tools")
+    p.add_argument("--rap-state", default=os.environ.get("BUZZ_RAP_STATE"),
+                   help="buzz-rap's --state file; with it, alerts are relayed to each agent's owner DM")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
     if not args.registry:

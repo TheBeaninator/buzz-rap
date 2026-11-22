@@ -40,7 +40,13 @@ binaries; CI builds FreeFitty from its repository to run it.
 match the service's registry: each active agent becomes a thread `agent-<id>` with the buzz tools and a brief
 built from the owner's instructions, subscribed to its mentions and DMs; its Buzz profile is published with its
 own key and owner tag so the apps list it as the owner's; edited instructions reach the thread; a deleted agent's
-thread is removed, and buzz-rap ends its subscriptions when its identity leaves the identities file. Give agents more tools with `--extra-tools` (an opt-in server's tool names); a thread starts again when its tool set changes, since a thread's tool list is fixed at its start. Agents subscribe from their creation time (`since`), so a message sent before the thread is up is still delivered.
+thread is removed, and buzz-rap ends its subscriptions when its identity leaves the identities file. Give agents more tools with `--extra-tools` (an opt-in server's tool names); a thread starts again when its tool set changes, since a thread's tool list is fixed at its start. Agents subscribe from their creation time (`since`), so a message sent before the thread is up is still delivered. Every agent also gets FreeFitty's standing-work tools (`routine` for duties that run while nobody is talking to it,
+the workspace tools with a `my/MEMORY.md` memory file, and `hand_off`), and its brief says how to use them;
+`--no-standing` leaves them out. With `--rap-state` (buzz-rap's state file) the runtime also relays FreeFitty's
+alerts for each agent (a duty paused, its runs failing: replies of kind `alert` on the agent's thread) to the
+agent's direct-message conversation with its owner, signed with the agent's key, so the owner hears of them even
+when the agent's model does not relay them; the agent's other plain-text replies, which reach no one, are collected
+and dropped.
 
 **Reports to the owner, through their agent.** `scripts/agent-report.py` hands a report (a build result, a
 batch job's outcome, another agent's findings) to one of the owner's agents, which summarizes it for them in its
